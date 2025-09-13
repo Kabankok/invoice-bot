@@ -1,107 +1,65 @@
-#!/usr/bin/env python3
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-user = update.effective_user
-uid = user.id if user else None
-await update.effective_message.reply_text(f"Ваш user_id: {uid}")
+import logging
+import os
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
+from store import store_invoice
+from keyboards import moderation_keyboard
+from moderation import handle_moderation
 
-# --- Утилиты ---
-def detect_kind_from_message(msg) -> str:
-if getattr(msg, "photo", None): return "photo"
-if getattr(msg, "document", None):
-mime = (msg.document.mime_type or "").lower()
-if mime in {
-"application/vnd.ms-excel",
-"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-}: return "excel"
-return "document"
-return "unknown"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") + "/webhook"
+ADMIN_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid]
+
+# --- Команды ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(f"Привет, {user.first_name}! Бот на связи ✅")
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Webhook: {WEBHOOK_URL}\nAdmin IDs: {ADMIN_IDS}"
+    )
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(f"Твой user_id: {user.id}")
 
 # --- Обработка файлов ---
-async def handle_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-chat = update.effective_chat
-msg = update.effective_message
-if not chat or not msg: return
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = update.message.effective_attachment
+    msg = await update.message.reply_text(
+        f"📄 Счёт получен (тип: {file.file_unique_id}) — Ожидает согласования",
+        reply_markup=moderation_keyboard()
+    )
+    store_invoice(msg.message_id, status="pending")
 
+# --- Main ---
+def main():
+    app = Application.builder().token(TOKEN).build()
 
-thread_id = getattr(msg, "message_thread_id", None)
-kind = detect_kind_from_message(msg)
-key = (chat.id, msg.message_id)
+    # команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("debug", debug))
+    app.add_handler(CommandHandler("whoami", whoami))
 
+    # файлы
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 
-STORE.put_invoice(key, kind)
-log.info("Got FILE(message) | chat_id=%s thread_id=%s user_id=%s kind=%s",
-chat.id, thread_id, getattr(getattr(msg, 'from_user', None), 'id', None), kind)
+    # кнопки
+    app.add_handler(CallbackQueryHandler(handle_moderation))
 
-
-text = ("📄 Счёт получен.\n"
-f"Статус: {STATUS_WAIT}\n"
-f"Тип файла: {kind}\n"
-f"chat_id: {chat.id}, message_id: {msg.message_id}\n"
-"Нажмите кнопку ниже.")
-
-
-sent = await msg.reply_text(text, reply_markup=approval_keyboard(chat.id, msg.message_id))
-STORE.set_status_msg_id(key, sent.message_id)
-
-
-async def handle_file_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-chat = update.effective_chat
-post = update.channel_post
-if not chat or not post: return
-
-
-kind = detect_kind_from_message(post)
-key = (chat.id, post.message_id)
-STORE.put_invoice(key, kind)
-
-
-log.info("Got FILE(channel_post) | chat_id=%s kind=%s", chat.id, kind)
-
-
-text = ("📄 Счёт получен в канале.\n"
-f"Статус: {STATUS_WAIT}\n"
-f"Тип файла: {kind}\n"
-f"chat_id: {chat.id}, message_id: {post.message_id}\n"
-"Нажмите кнопку ниже.")
-
-
-sent = await context.bot.send_message(chat_id=chat.id, text=text,
-reply_markup=approval_keyboard(chat.id, post.message_id))
-STORE.set_status_msg_id(key, sent.message_id)
-
-
-# --- Запуск ---
-async def _post_init(app):
-me = await app.bot.get_me()
-log.info("Bot getMe: username=@%s id=%s", me.username, me.id)
-
-
-def main() -> None:
-app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
-
-
-app.add_handler(CommandHandler("start", cmd_start))
-app.add_handler(CommandHandler("debug", cmd_debug))
-app.add_handler(CommandHandler("whoami", cmd_whoami))
-
-
-app.add_handler(CallbackQueryHandler(on_callback))
-
-
-app.add_handler(MessageHandler((filters.Document.ALL | filters.PHOTO) & ~filters.ChatType.CHANNEL, handle_file_message))
-app.add_handler(MessageHandler((filters.Document.ALL | filters.PHOTO) & filters.ChatType.CHANNEL, handle_file_channel))
-
-
-app.run_webhook(
-listen="0.0.0.0",
-port=PORT,
-url_path="/webhook",
-webhook_url=WEBHOOK_URL or None,
-drop_pending_updates=True,
-)
-
+    # запуск вебхука
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        url_path="webhook",
+        webhook_url=WEBHOOK_URL,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
-main()
+    main()
