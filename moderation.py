@@ -1,72 +1,36 @@
-from __future__ import annotations
-import os
-from typing import Set, Tuple
+# moderation.py
 from telegram import Update
 from telegram.ext import ContextTypes
+from store import store
 
+APPROVE_CB = "approve"
+REJECT_CB = "reject"
 
-from store import STORE, STATUS_OK, STATUS_REJ
-from keyboards import parse_callback, APPROVE_CB, REJECT_CB
+async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
+    data = query.data.split(":")
+    action = data[0]
+    chat_id = int(data[1])
+    message_id = int(data[2])
 
-# Разрешённые пользователи (админы), которые могут нажимать кнопки
-ADMIN_USER_IDS: Set[int] = {
-int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
-}
+    invoice = store.get(message_id)
+    status = invoice.get("status", "?") if invoice else "?"
 
+    if action == APPROVE_CB:
+        store.update(message_id, "approved")
+        new_status = "✔️ Согласован"
+    elif action == REJECT_CB:
+        store.update(message_id, "rejected")
+        new_status = "✖️ Отклонён"
+    else:
+        new_status = status
 
-def build_status_caption(invoice: dict) -> str:
-status = invoice.get("status", "?")
-kind = invoice.get("kind", "?")
-return (
-"📄 Счёт\n"
-f"Статус: {status}\n"
-f"Тип файла: {kind}\n"
-"(Журнал/комментарии добавим позже)"
-)
-
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-q = update.callback_query
-if not q:
-return
-await q.answer()
-
-
-user_id = q.from_user.id if q.from_user else 0
-if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
-await q.reply_text("⛔ У вас нет прав на эту операцию.")
-return
-
-
-try:
-action, chat_id, msg_id = parse_callback(q.data or "")
-except Exception:
-await q.reply_text("Некорректные данные кнопки")
-return
-
-
-key = (chat_id, msg_id)
-invoice = STORE.get(key)
-if not invoice:
-await q.reply_text("Счёт не найден (возможно, сервис перезапускался)")
-return
-
-
-if action == APPROVE_CB:
-invoice["status"] = STATUS_OK
-elif action == REJECT_CB:
-invoice["status"] = STATUS_REJ
-else:
-await q.reply_text("Неизвестное действие")
-return
-
-
-status_msg_id = invoice.get("status_msg_id")
-if isinstance(status_msg_id, int):
-await context.bot.edit_message_text(
-chat_id=chat_id,
-message_id=status_msg_id,
-text=build_status_caption(invoice),
-)
+    try:
+        await query.edit_message_text(
+            text=f"Статус счёта обновлён: {new_status}"
+        )
+    except Exception as e:
+        await query.message.reply_text(f"Ошибка обновления статуса: {e}")
 await q.reply_text("Готово ✅")
