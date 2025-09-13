@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, logging
+import os
+import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 from store import store_invoice, store
 from keyboards import moderation_keyboard
 from moderation import handle_moderation, handle_reason_message
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("main_web_v2")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
+
 if not TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN is missing")
 if not WEBHOOK_URL:
@@ -33,13 +45,15 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой user_id: {user.id}")
 
 # --- Вспомогательное ---
-
 def _detect_kind(msg) -> str:
     if getattr(msg, "photo", None):
         return "photo"
     if getattr(msg, "document", None):
         mt = (msg.document.mime_type or "").lower()
-        if mt in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}:
+        if mt in {
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }:
             return "excel"
         return "document"
     return "unknown"
@@ -51,18 +65,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = getattr(msg_in, "message_thread_id", None)
     kind = _detect_kind(msg_in)
 
-    # 1) создаём статусное сообщение БОТА
-    text = (
-        "📄 Счёт получен — Ожидает согласования
-"
-        f"Тип: {kind}"
-    )
+    # 1) создаём статусное сообщение БОТА (на нём будут кнопки/статус)
+    text = f"""📄 Счёт получен — Ожидает согласования
+Тип: {kind}"""
     sent = await msg_in.reply_text(text, reply_markup=moderation_keyboard(chat.id, 0))
 
     # 2) фиксируем запись в хранилище по ИД статусного сообщения БОТА
     store_invoice(sent.message_id, status="WAIT", kind=kind)
 
-    # 3) привяжем исходный файл к карточке (нужно для шага QR)
+    # 3) привяжем исходный файл к карточке (для шага QR)
     if msg_in.document:
         file_id = msg_in.document.file_id
         ftype = "document"
@@ -90,7 +101,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # --- Main ---
-
 def main():
     app = Application.builder().token(TOKEN).build()
 
