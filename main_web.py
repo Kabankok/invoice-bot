@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main_web.py — Шаг 1 (фикс «не отвечает /start», расширенное логирование)
------------------------------------------------------------------------
-Что добавлено:
-- Явный ответ на /start в ЛС и в группе/теме.
-- Глобальный логгер входящих апдейтов (видно, приходят ли апдейты вообще).
-- Лог getMe (username/id бота) при старте — проверяем, что токен от того бота.
-- Простая проверка health: GET / — вернёт 200 OK (для Render Health Check можно указать "/").
-- Никаких фильтров по chat_id/thread_id на этом шаге — реагируем везде.
-
-Деплой: заменить весь файл на этот, сохранить, Deploy latest.
+main_web.py — Шаг 1 (исправленный)
+----------------------------------
+- Отвечает на /start (и в ЛС, и в группах).
+- Принимает документы/фото/Excel, отвечает в ту же тему.
+- Логирует все апдейты для отладки.
+- Добавлен health-check "/" → OK.
 """
+
 from __future__ import annotations
 import os
 import logging
-from typing import Optional
-
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ChatType
@@ -42,10 +37,12 @@ PORT = int(os.getenv("PORT", "10000"))
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN is required")
 
+
 # ============================== Хелперы =======================================
 async def is_group_or_private(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type in (ChatType.SUPERGROUP, ChatType.GROUP, ChatType.PRIVATE))
+
 
 # ============================ Хендлеры ========================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -54,11 +51,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     thread_id = getattr(msg, "message_thread_id", None)
     await msg.reply_text(
-        "Бот на связи ✅
-Пришлите PDF/изображение/Excel в нужной теме — отвечу и запишу ID темы.
-"
+        f"Бот на связи ✅\n"
+        f"Пришлите PDF/изображение/Excel в нужной теме — отвечу и запишу ID темы.\n"
         f"(chat_id={update.effective_chat.id}, thread_id={thread_id})"
     )
+
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_group_or_private(update):
@@ -72,34 +69,47 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         kind = "photo"
     elif msg.document:
         mime = (msg.document.mime_type or "").lower()
-        if mime in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}:
+        if mime in {
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }:
             kind = "excel"
         else:
             kind = "document"
 
-    log.info("Got FILE | chat_id=%s thread_id=%s user_id=%s kind=%s", chat.id, thread_id, msg.from_user.id if msg.from_user else None, kind)
+    log.info(
+        "Got FILE | chat_id=%s thread_id=%s user_id=%s kind=%s",
+        chat.id,
+        thread_id,
+        msg.from_user.id if msg.from_user else None,
+        kind,
+    )
 
     await msg.reply_text(
-        "✅ Получил файл.
-"
-        f"Тип: {kind}
-"
-        f"chat_id: {chat.id}
-"
-        f"message_thread_id: {thread_id}
-"
+        f"✅ Получил файл.\n"
+        f"Тип: {kind}\n"
+        f"chat_id: {chat.id}\n"
+        f"message_thread_id: {thread_id}\n"
         "Это шаг 1 (проверка вебхука). OCR/GPT/QR добавим на следующих шагах."
     )
 
+
 async def log_everything(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Логируем все апдейты, чтобы понять, доходят ли они до вебхука."""
+    """Логируем все апдейты, чтобы видеть поток."""
     try:
         chat = update.effective_chat
         msg = update.effective_message
         thread_id = getattr(msg, "message_thread_id", None) if msg else None
-        log.info("Got UPDATE | type=%s chat_id=%s thread_id=%s user_id=%s", type(update).__name__, getattr(chat, 'id', None), thread_id, getattr(getattr(msg, 'from_user', None), 'id', None))
+        log.info(
+            "Got UPDATE | type=%s chat_id=%s thread_id=%s user_id=%s",
+            type(update).__name__,
+            getattr(chat, "id", None),
+            thread_id,
+            getattr(getattr(msg, "from_user", None), "id", None),
+        )
     except Exception as e:
         log.warning("log_everything error: %s", e)
+
 
 # ========================== Webhook + Health ==================================
 async def _post_init(app):
@@ -111,8 +121,10 @@ async def _post_init(app):
     else:
         log.warning("WEBHOOK_URL not set; set it to your Render URL + /webhook")
 
+
 async def health(request: web.Request) -> web.Response:
     return web.Response(text="OK", status=200)
+
 
 # ========================= Запуск приложения ==================================
 def main() -> None:
@@ -122,10 +134,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 
-    # Глобальный лог апдейтов (ставим последним, самый общий фильтр)
+    # Глобальный лог апдейтов
     app.add_handler(MessageHandler(filters.ALL, log_everything))
 
-    # Встроенный webhook-сервер PTB + свой health на "/"
+    # aiohttp-приложение для health-check
     aiohttp_app = web.Application()
     aiohttp_app.router.add_get("/", health)
 
@@ -133,9 +145,10 @@ def main() -> None:
         listen="0.0.0.0",
         port=PORT,
         webhook_url=WEBHOOK_URL or None,
-        web_app=aiohttp_app,           # отдаём "/"=OK для Health Check
+        web_app=aiohttp_app,
         drop_pending_updates=True,
     )
+
 
 if __name__ == "__main__":
     main()
