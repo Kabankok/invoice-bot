@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main_web.py — Шаг 1 (фикс: нет aiohttp)
----------------------------------------
-Теперь убрали зависимость от aiohttp. Используем только встроенный webhook-сервер PTB.
-Добавлено:
-- Ответ на /start в ЛС и в группе/теме.
-- Лог всех апдейтов.
-- Лог getMe при старте.
+main_web.py — Шаг 1.1 (учитываем КАНАЛЫ + /debug)
+-------------------------------------------------
+Что изменено/добавлено:
+- Обрабатываем не только группы/супергруппы, но и КАНАЛЫ (channel_post).
+- Ловим файлы из каналов и отвечаем постом в этот же канал (бот должен быть админом канала!).
+- Лучшая диагностика: команда /debug печатает getWebhookInfo (куда сейчас смотрит вебхук).
+- По-прежнему: /start отвечает и в ЛС, и в группах/темах; лог всех апдейтов включён.
 
-Деплой: заменить этот файл, убедиться что в requirements.txt стоит:
+Важно: если вам нужны темы/кнопки модерации — используйте супергруппу с темами, а не канал. 
+В каналах тем нет; «комментарии к постам» — это отдельная «Привязанная группа», с ней мы подружим бота на следующих шагах.
+
+requirements.txt:
   python-telegram-bot[webhooks]==21.4
 """
 from __future__ import annotations
@@ -42,50 +45,101 @@ if not TELEGRAM_BOT_TOKEN:
 # ============================ Хендлеры ========================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    msg = update.effective_message
+    msg = update.effective_message or update.channel_post
     if not chat or not msg:
         return
     thread_id = getattr(msg, "message_thread_id", None)
-    await msg.reply_text(
-        "Бот на связи ✅\nПришлите PDF/изображение/Excel в нужной теме — отвечу и запишу ID темы.\n"
+    text = (
+        "Бот на связи ✅\n"
+        "Пришлите PDF/изображение/Excel — отвечу и запишу ID.\n"
         f"(chat_id={chat.id}, thread_id={thread_id})"
     )
+    # Если это обычное сообщение — отвечаем реплаем; если канал — отправляем новым постом
+    if hasattr(msg, "reply_text"):
+        await msg.reply_text(text)
+    else:
+        await context.bot.send_message(chat_id=chat.id, text=text, message_thread_id=thread_id or None)
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    info = await context.bot.get_webhook_info()
+    text = (
+        "🔎 Webhook debug:\n"
+        f"url: {info.url or '—'}\n"
+        f"has_custom_certificate: {info.has_custom_certificate}\n"
+        f"pending_update_count: {info.pending_update_count}\n"
+    )
+    msg = update.effective_message or update.channel_post
+    chat = update.effective_chat
+    if msg and hasattr(msg, "reply_text"):
+        await msg.reply_text(text)
+    elif chat:
+        await context.bot.send_message(chat_id=chat.id, text=text)
+
+async def handle_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Файлы из групп/супергрупп/ЛС (message)."""
     chat = update.effective_chat
     msg = update.effective_message
     if not chat or not msg:
         return
     thread_id = getattr(msg, "message_thread_id", None)
+    kind = detect_kind_from_message(msg)
+    log.info(
+        "Got FILE(message) | chat_id=%s thread_id=%s user_id=%s kind=%s",
+        chat.id,
+        thread_id,
+        getattr(getattr(msg, 'from_user', None), 'id', None),
+        kind,
+    )
 
-    kind = "document"
-    if msg.photo:
-        kind = "photo"
-    elif msg.document:
-        mime = (msg.document.mime_type or "").lower()
-        if mime in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}:
-            kind = "excel"
-        else:
-            kind = "document"
-
-    log.info("Got FILE | chat_id=%s thread_id=%s user_id=%s kind=%s", chat.id, thread_id, msg.from_user.id if msg.from_user else None, kind)
-
-    await msg.reply_text(
+    text = (
         "✅ Получил файл.\n"
         f"Тип: {kind}\n"
         f"chat_id: {chat.id}\n"
         f"message_thread_id: {thread_id}\n"
-        "Это шаг 1 (проверка вебхука). OCR/GPT/QR добавим на следующих шагах."
+        "Это шаг 1 (проверка вебхука). OCR/GPT/QR на следующих шагах."
     )
+    await msg.reply_text(text)
+
+async def handle_file_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Файлы из КАНАЛОВ (channel_post). Бот должен быть админом канала."""
+    chat = update.effective_chat
+    post = update.channel_post
+    if not chat or not post:
+        return
+    kind = detect_kind_from_message(post)
+    log.info("Got FILE(channel_post) | chat_id=%s kind=%s", chat.id, kind)
+
+    # В каналах нет thread_id. Отвечаем новым постом в канал (нужны права администратора).
+    text = (
+        "✅ Получил файл в канале.\n"
+        f"Тип: {kind}\n"
+        f"chat_id: {chat.id}\n"
+        "Это шаг 1 (webhook OK). Для модерации/кнопок лучше использовать супергруппу с темами."
+    )
+    await context.bot.send_message(chat_id=chat.id, text=text)
 
 async def log_everything(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         chat = update.effective_chat
-        msg = update.effective_message
+        msg = update.effective_message or update.channel_post
         thread_id = getattr(msg, "message_thread_id", None) if msg else None
-        log.info("Got UPDATE | type=%s chat_id=%s thread_id=%s user_id=%s", type(update).__name__, getattr(chat, 'id', None), thread_id, getattr(getattr(msg, 'from_user', None), 'id', None))
+        log.info(
+            "Got UPDATE | type=%s chat_type=%s chat_id=%s thread_id=%s",
+            type(update).__name__, getattr(chat, 'type', None), getattr(chat, 'id', None), thread_id,
+        )
     except Exception as e:
         log.warning("log_everything error: %s", e)
+
+# ============================ Утилиты =========================================
+def detect_kind_from_message(msg) -> str:
+    if getattr(msg, 'photo', None):
+        return 'photo'
+    if getattr(msg, 'document', None):
+        mime = (msg.document.mime_type or '').lower()
+        if mime in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}:
+            return 'excel'
+        return 'document'
+    return 'unknown'
 
 # ========================= Запуск приложения ==================================
 async def _post_init(app):
@@ -97,11 +151,21 @@ async def _post_init(app):
     else:
         log.warning("WEBHOOK_URL not set; set it to your Render URL + /webhook")
 
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
+    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(CommandHandler("debug", cmd_debug))
+
+    # Файлы из групп/супергрупп/ЛС
+    app.add_handler(MessageHandler((filters.Document.ALL | filters.PHOTO) & ~filters.ChatType.CHANNEL, handle_file_message))
+
+    # Файлы из КАНАЛОВ (channel_post)
+    app.add_handler(MessageHandler((filters.Document.ALL | filters.PHOTO) & filters.ChatType.CHANNEL, handle_file_channel))
+
+    # Лог всего остального
     app.add_handler(MessageHandler(filters.ALL, log_everything))
 
     app.run_webhook(
@@ -111,7 +175,7 @@ def main() -> None:
         drop_pending_updates=True,
     )
 
+
 if __name__ == "__main__":
     main()
-
 
