@@ -33,4 +33,4 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await query.message.reply_text(f"Ошибка обновления статуса: {e}")
-await q.reply_text("Готово ✅")
+
