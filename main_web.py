@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main_web.py — Шаг 1.2 (фикс роутинга вебхука + /debug)
-------------------------------------------------------
-Проблема была в том, что сервер PTB слушал путь по умолчанию ("/<bot_token>"),
-а Telegram присылал POST на "/webhook". Исправляем: явно ставим url_path="/webhook".
-Также убрал лишний ручной set_webhook — теперь вебхук ставится один раз через run_webhook.
+main_web.py — Шаг 1.3 (фикс синтаксиса строк)
+--------------------------------------------
+Ошибка была в том, что многострочные строки не были закрыты. Исправил: 
+теперь строки формируются с использованием склеивания и `\n`.
 
 requirements.txt:
   python-telegram-bot[webhooks]==21.4
@@ -45,10 +44,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     thread_id = getattr(msg, "message_thread_id", None)
     text = (
-        "Бот на связи ✅
-"
-        "Пришлите PDF/изображение/Excel — отвечу и запишу ID.
-"
+        "Бот на связи ✅\n"
+        "Пришлите PDF/изображение/Excel — отвечу и запишу ID.\n"
         f"(chat_id={chat.id}, thread_id={thread_id})"
     )
     if hasattr(msg, "reply_text"):
@@ -60,14 +57,10 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     info = await context.bot.get_webhook_info()
     me = await context.bot.get_me()
     text = (
-        "🔎 Webhook debug:
-"
-        f"bot: @{me.username} (id={me.id})
-"
-        f"url: {info.url or '—'}
-"
-        f"pending_update_count: {info.pending_update_count}
-"
+        "🔎 Webhook debug:\n"
+        f"bot: @{me.username} (id={me.id})\n"
+        f"url: {info.url or '—'}\n"
+        f"pending_update_count: {info.pending_update_count}\n"
     )
     msg = update.effective_message or update.channel_post
     chat = update.effective_chat
@@ -92,14 +85,10 @@ async def handle_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         kind,
     )
     text = (
-        "✅ Получил файл.
-"
-        f"Тип: {kind}
-"
-        f"chat_id: {chat.id}
-"
-        f"message_thread_id: {thread_id}
-"
+        "✅ Получил файл.\n"
+        f"Тип: {kind}\n"
+        f"chat_id: {chat.id}\n"
+        f"message_thread_id: {thread_id}\n"
         "Это шаг 1 (проверка вебхука). OCR/GPT/QR на следующих шагах."
     )
     await msg.reply_text(text)
@@ -113,12 +102,9 @@ async def handle_file_channel(update: Update, context: ContextTypes.DEFAULT_TYPE
     kind = detect_kind_from_message(post)
     log.info("Got FILE(channel_post) | chat_id=%s kind=%s", chat.id, kind)
     text = (
-        "✅ Получил файл в канале.
-"
-        f"Тип: {kind}
-"
-        f"chat_id: {chat.id}
-"
+        "✅ Получил файл в канале.\n"
+        f"Тип: {kind}\n"
+        f"chat_id: {chat.id}\n"
         "Это шаг 1 (webhook OK). Для модерации/кнопок лучше использовать супергруппу с темами."
     )
     await context.bot.send_message(chat_id=chat.id, text=text)
@@ -171,12 +157,11 @@ def main() -> None:
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="/webhook",            # 👈 важный фикс: сервер слушает именно этот путь
-        webhook_url=WEBHOOK_URL or None, # должен совпадать и указывать на .../webhook
+        url_path="/webhook",
+        webhook_url=WEBHOOK_URL or None,
         drop_pending_updates=True,
     )
 
 
 if __name__ == "__main__":
     main()
-
