@@ -16,8 +16,8 @@ def moderation_keyboard(chat_id: int, status_msg_id: int):
 
     if st == WAIT:
         rows = [[
-            InlineKeyboardButton("✔️ Согласовать", callback_data=f"{APPROVE_CB}:{chat_id}:{status_msg_id}"),
-            InlineKeyboardButton("✖️ Отклонить",  callback_data=f"{REJECT_CB}:{chat_id}:{status_msg_id}"),
+            InlineKeyboardButton("✅ Согласовать", callback_data=f"{APPROVE_CB}:{chat_id}:{status_msg_id}"),
+            InlineKeyboardButton("❌ Отклонить",  callback_data=f"{REJECT_CB}:{chat_id}:{status_msg_id}"),
         ]]
     elif st == APPROVED:
         rows = [[
@@ -35,4 +35,5 @@ def moderation_keyboard(chat_id: int, status_msg_id: int):
         rows = []  # финал — без кнопок
 
     return InlineKeyboardMarkup(rows) if rows else None
+
 
