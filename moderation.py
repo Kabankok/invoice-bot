@@ -12,9 +12,12 @@ from keyboards import (
 )
 from processor import on_approved_send_qr
 
-ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
+# Админы, которым разрешено жать кнопки
+ADMIN_USER_IDS = {
+    int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+}
 
-# user_id -> (chat_id, status_msg_id): ожидаем одно текстовое сообщение с причиной
+# user_id -> (chat_id, status_msg_id): ждём одно текстовое сообщение с причиной
 WAITING_REASON: Dict[int, Tuple[int, int]] = {}
 
 
@@ -34,8 +37,7 @@ def build_status_text(inv: dict) -> str:
     lines = ["📄 Счёт", f"Статус: {status}"]
     if inv.get("status") == REJECTED and reason:
         lines.append(f"Причина: {reason}")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 
 async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -59,19 +61,24 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == APPROVE_CB:
         store.set_status(status_msg_id, APPROVED)
-        # сразу отправляем QR (асинхронно)
+        # Сразу отправляем QR под карточкой (асинхронно)
         await on_approved_send_qr(context, chat_id=chat_id, status_msg_id=status_msg_id)
+
     elif action == REJECT_CB:
         store.set_status(status_msg_id, REJECTED)
+
     elif action == REASON_CB:
         # ждём одно сообщение от этого же пользователя с текстом причины
         WAITING_REASON[user_id] = (chat_id, status_msg_id)
         await q.message.reply_text("📝 Напишите одной строкой причину отклонения этого счёта.")
         return
+
     elif action == PAID_CB:
         store.set_status(status_msg_id, PAID)
+
     elif action == RECEIVED_CB:
         store.set_status(status_msg_id, RECEIVED)
+
     else:
         await q.reply_text("Неизвестное действие")
         return
@@ -87,6 +94,7 @@ async def handle_reason_message(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     if not user:
         return
+
     pending = WAITING_REASON.get(user.id)
     if not pending:
         return  # чужие тексты игнорируем
