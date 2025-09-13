@@ -1,4 +1,4 @@
-# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.1)
+# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.2)
 from __future__ import annotations
 import io
 import os
@@ -9,7 +9,7 @@ import logging
 from typing import Tuple, Optional
 
 from openai import OpenAI
-import qrcode  # требует pillow
+import qrcode  # pillow обязателен
 
 from telegram.ext import ContextTypes
 from store import store
@@ -19,14 +19,15 @@ log = logging.getLogger("processor")
 NBSP = "\u00A0"
 ST00012_REQUIRED = ["Name", "PersonalAcc", "BankName", "BIC", "CorrespAcc", "Sum", "Purpose"]
 
+# ---------- utils ----------
 def _qr_png_bytes(payload: str) -> bytes:
     img = qrcode.make(payload)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def _to_data_uri(image_bytes: bytes, mime: str) -> str:
-    return f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+def _to_data_uri(b: bytes, mime: str) -> str:
+    return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
 
 def _guess_mime(file_type: str) -> str:
     return "image/jpeg" if file_type == "photo" else "application/pdf"
@@ -63,17 +64,18 @@ def _excel_to_text(file_bytes: bytes) -> str:
         return ""
 
 # ---------- validate & caption ----------
-def _validate_st00012(s: str) -> Optional[str]:
-    if not s or not s.startswith("ST00012|"):
+def _validate_st00012(st: str) -> Optional[str]:
+    if not st or not st.startswith("ST00012|"):
         return "payload is not ST00012"
     fields = {}
     try:
-        for p in s.split("|")[1:]:
+        for p in st.split("|")[1:]:
             if "=" in p:
                 k, v = p.split("=", 1)
                 fields[k] = v
     except Exception:
         return "failed to parse key=value pairs"
+
     missing = [k for k in ST00012_REQUIRED if k not in fields or not fields[k].strip()]
     if missing:
         return f"missing fields: {', '.join(missing)}"
@@ -91,63 +93,71 @@ def _caption_from_fields(fields: dict) -> str:
     purpose = fields.get("Purpose", "")
     return f"Получатель: {name}\nСумма: {amount} RUB\nНазначение: {purpose}"
 
-# ---------- GPT ----------
+# ---------- GPT (Chat Completions + strict JSON) ----------
 GPT_MODEL = os.getenv("GPT_INVOICE_MODEL", "gpt-4o-mini")
-INSTRUCTIONS = (
+
+SYSTEM_PROMPT = (
     "Ты финансовый парсер инвойсов. По входному файлу (PDF/изображение/таблица) найди реквизиты "
-    "для платежного QR по стандарту GOST ST00012 (Россия). Верни JSON со строкой ST00012 и разобранными полями.\n"
-    "1) Обязательные поля: Name, PersonalAcc, BankName, BIC, CorrespAcc, Sum (в копейках), Purpose.\n"
-    "2) Sum — целое число копеек (напр. 179500 для 1 795,00).\n"
-    "3) Purpose: «Оплата по счёту №… от …; НДС …% …» — явно укажи, есть НДС или нет.\n"
-    "4) Если данных нет в файле — не выдумывай; укажи в 'notes'.\n"
-    "Формат ответа строго:\n"
-    "{\n"
-    '  "st": "ST00012|Name=...|PersonalAcc=...|BankName=...|BIC=...|CorrespAcc=...|Sum=...|Purpose=...",\n'
-    '  "fields": {"Name":"...","PersonalAcc":"...","BankName":"...","BIC":"...","CorrespAcc":"...","Sum":"...","Purpose":"..."},\n'
-    '  "notes": "..." \n'
-    "}\n"
+    "для платежного QR по стандарту GOST ST00012 (Россия). Отвечай строго JSON-объектом: "
+    '{"st":"ST00012|Name=...|PersonalAcc=...|BankName=...|BIC=...|CorrespAcc=...|Sum=...|Purpose=...",'
+    '"fields":{"Name":"...","PersonalAcc":"...","BankName":"...","BIC":"...","CorrespAcc":"...","Sum":"...","Purpose":"..."},'
+    '"notes":"..."} '
+    "Требования: Sum — целое число копеек (напр. 179500 для 1 795,00). "
+    "Purpose должен явно указывать, есть НДС или нет. Если каких-то данных нет в документе — не выдумывай, укажи это в notes."
 )
 
-async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
-    """(st_string, fields_dict, notes) либо (None, None, reason)"""
+def _client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
-        return None, None, "OPENAI_API_KEY is missing"
+        raise RuntimeError("OPENAI_API_KEY is missing")
+    return OpenAI(api_key=api_key)
 
+def _parse_json(text: str) -> dict:
+    # забираем первый валидный JSON-объект в ответе
+    s, e = text.find("{"), text.rfind("}")
+    if s == -1 or e == -1 or e <= s:
+        raise ValueError("no JSON object found")
+    return json.loads(text[s:e+1])
+
+async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
+    """
+    Возвращает (st_string, fields_dict, notes) либо (None, None, reason)
+    """
     try:
-        client = OpenAI(api_key=api_key)
+        client = _client()
     except Exception as e:
-        return None, None, f"OpenAI client init error: {e}"
+        return None, None, f"OpenAI key/client error: {e}"
 
     if file_type in ("document", "photo"):
         mime = _guess_mime(file_type)
         data_uri = _to_data_uri(file_bytes, mime)
-        content = [
-            {"type": "text", "text": INSTRUCTIONS},
-            {"type": "input_text", "text": "Проанализируй документ и верни JSON как описано."},
+        user_content = [
+            {"type": "text", "text": "Проанализируй документ и верни JSON как описано."},
             {"type": "image_url", "image_url": {"url": data_uri}},
         ]
     else:
         txt = _excel_to_text(file_bytes)
-        content = [
-            {"type": "text", "text": INSTRUCTIONS},
-            {"type": "input_text", "text": "Текстовое представление таблицы ниже:\n" + (txt[:15000] if txt else "")},
+        user_content = [
+            {"type": "text", "text": "Ниже — текстовое представление таблицы. Верни JSON как описано."},
+            {"type": "text", "text": txt[:15000] if txt else ""},
         ]
 
     try:
-        resp = client.responses.create(
+        resp = client.chat.completions.create(
             model=GPT_MODEL,
-            input=[{"role": "user", "content": content}],
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
             temperature=0.0,
         )
-        raw = resp.output_text
+        raw = resp.choices[0].message.content or ""
     except Exception as e:
         return None, None, f"GPT error: {e}"
 
     try:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        data = json.loads(raw[start:end+1])
+        data = _parse_json(raw)
     except Exception as e:
         return None, None, f"Bad JSON from GPT: {e}"
 
@@ -183,7 +193,7 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
             caption = f"⚠️ Некорректный GOST QR: {err}"
             st = None
     else:
-        caption = f"⚠️ GPT не вернул строку ST00012. {notes or ''}".strip()
+        caption = f"⚠️ GPT не вернул ST00012. {notes or ''}".strip()
 
     # 3) успех → отправляем рабочий QR
     if st and fields:
@@ -201,10 +211,10 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         except Exception as e:
             caption = f"⚠️ Не удалось сгенерировать QR: {e}"
 
-    # 4) fallback: «демо-QR» и пояснение, чтобы админ видел проблему
+    # 4) fallback: демо-QR + пояснение
     demo_payload = "ST00012|Name=ERROR|PersonalAcc=00000000000000000000|BankName=ERROR|BIC=000000000|CorrespAcc=00000000000000000000|Sum=0|Purpose=Parse failed"
     png = _qr_png_bytes(demo_payload)
-    fallback_caption = "Не удалось собрать рабочий QR. Проверьте реквизиты в счёте или пришлите образец для настройки."
+    fallback_caption = "Не удалось собрать рабочий QR. Проверьте реквизиты или пришлите образец для настройки."
     if caption:
         fallback_caption = caption + "\n\n" + fallback_caption
 
@@ -215,4 +225,3 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         message_thread_id=thread_id if thread_id else None,
         reply_to_message_id=status_msg_id,
     )
-
