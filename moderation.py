@@ -20,10 +20,10 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == APPROVE_CB:
         store.update(message_id, "approved")
-        new_status = "✔️ Согласован"
+        new_status = "✅ Согласован"
     elif action == REJECT_CB:
         store.update(message_id, "rejected")
-        new_status = "✖️ Отклонён"
+        new_status = "❌ Отклонён"
     else:
         new_status = status
 
@@ -33,4 +33,5 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await query.message.reply_text(f"Ошибка обновления статуса: {e}")
+
 
