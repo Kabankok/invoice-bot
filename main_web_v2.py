@@ -5,7 +5,7 @@ import os, logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-from store import store_invoice
+from store import store_invoice, store
 from keyboards import moderation_keyboard
 from moderation import handle_moderation, handle_reason_message
 
@@ -33,6 +33,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой user_id: {user.id}")
 
 # --- Вспомогательное ---
+
 def _detect_kind(msg) -> str:
     if getattr(msg, "photo", None):
         return "photo"
@@ -46,27 +47,50 @@ def _detect_kind(msg) -> str:
 # --- Обработка файлов ---
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_in = update.message
+    chat = msg_in.chat
+    thread_id = getattr(msg_in, "message_thread_id", None)
     kind = _detect_kind(msg_in)
 
+    # 1) создаём статусное сообщение БОТА
     text = (
-        "📄 Счёт получен — Ожидает согласования\n"
+        "📄 Счёт получен — Ожидает согласования
+"
         f"Тип: {kind}"
     )
-    # создаём статусное сообщение БОТА (на нём будут кнопки и статус)
-    sent = await msg_in.reply_text(
-        text,
-        reply_markup=moderation_keyboard(msg_in.chat_id, 0)  # временно 0, сейчас перезапишем корректно ниже
+    sent = await msg_in.reply_text(text, reply_markup=moderation_keyboard(chat.id, 0))
+
+    # 2) фиксируем запись в хранилище по ИД статусного сообщения БОТА
+    store_invoice(sent.message_id, status="WAIT", kind=kind)
+
+    # 3) привяжем исходный файл к карточке (нужно для шага QR)
+    if msg_in.document:
+        file_id = msg_in.document.file_id
+        ftype = "document"
+    elif msg_in.photo:
+        file_id = msg_in.photo[-1].file_id  # максимальное качество
+        ftype = "photo"
+    else:
+        file_id = ""
+        ftype = "unknown"
+
+    store.set_source(
+        sent.message_id,
+        chat_id=chat.id,
+        thread_id=thread_id,
+        user_msg_id=msg_in.message_id,
+        file_id=file_id,
+        file_type=ftype,
     )
-    # теперь перезапишем клавиатуру с корректным status_msg_id (это id 'sent')
+
+    # 4) перерисуем клавиатуру уже с корректным status_msg_id
     await context.bot.edit_message_reply_markup(
         chat_id=sent.chat_id,
         message_id=sent.message_id,
-        reply_markup=moderation_keyboard(sent.chat_id, sent.message_id)
+        reply_markup=moderation_keyboard(sent.chat_id, sent.message_id),
     )
-    # фиксируем запись в хранилище по ИД статусного сообщения БОТА
-    store_invoice(sent.message_id, status="WAIT", kind=kind)
 
 # --- Main ---
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -81,7 +105,7 @@ def main():
     # кнопки модерации
     app.add_handler(CallbackQueryHandler(handle_moderation))
 
-    # приём причины отклонения (одно текстовое сообщение от админа)
+    # приём причины отклонения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason_message))
 
     # запуск вебхука
@@ -95,4 +119,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
