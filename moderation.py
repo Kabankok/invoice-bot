@@ -13,9 +13,8 @@ from keyboards import (
 
 ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 
-# user_id -> (chat_id, status_msg_id) — ожидаем одно текстовое сообщение с причиной
+# user_id -> (chat_id, status_msg_id): ожидаем одно текстовое сообщение с причиной
 WAITING_REASON: Dict[int, Tuple[int, int]] = {}
-
 
 def _human_status(code: str) -> str:
     return {
@@ -26,16 +25,13 @@ def _human_status(code: str) -> str:
         RECEIVED: "Получен",
     }.get(code, code)
 
-
 def build_status_text(inv: dict) -> str:
     status = _human_status(inv.get("status", WAIT))
     reason = inv.get("reason") or ""
     lines = ["📄 Счёт", f"Статус: {status}"]
     if inv.get("status") == REJECTED and reason:
         lines.append(f"Причина: {reason}")
-    return "
-".join(lines)
-
+    return "\n".join(lines)
 
 async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -51,7 +47,7 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     data = (q.data or "").split(":")
     action = data[0] if data else ""
     chat_id = q.message.chat_id
-    status_msg_id = q.message.message_id  # кнопки живут на статусном сообщении
+    status_msg_id = q.message.message_id  # кнопки на статусном сообщении бота
 
     inv = store.get(status_msg_id) or {"status": WAIT, "reason": ""}
 
@@ -77,14 +73,13 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup=moderation_keyboard(chat_id, status_msg_id),
     )
 
-
 async def handle_reason_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
     pending = WAITING_REASON.get(user.id)
     if not pending:
-        return  # для других сообщений ничего не делаем
+        return  # чужие тексты игнорируем
 
     chat_id, status_msg_id = pending
     reason_text = (update.effective_message.text or "").strip()
