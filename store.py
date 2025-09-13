@@ -1,36 +1,30 @@
-from __future__ import annotations
-from typing import Dict, Tuple, Optional
+# store.py
+# Хранилище счетов (в памяти, без БД)
 
 
-InvoiceKey = Tuple[int, int] # (chat_id, message_id)
-
-
-STATUS_WAIT = "Ожидает согласования"
-STATUS_OK = "Согласован"
-STATUS_REJ = "Отклонён"
-
-
-class InMemoryStore:
+class InvoiceStore:
 def __init__(self) -> None:
-self._data: Dict[InvoiceKey, Dict[str, object]] = {}
+# словарь: message_id -> {status, reason}
+self.invoices = {}
 
 
-def put_invoice(self, key: InvoiceKey, kind: str) -> None:
-self._data[key] = {"status": STATUS_WAIT, "kind": kind, "status_msg_id": None}
+def add(self, message_id: int, status: str = "pending", reason: str = "") -> None:
+self.invoices[message_id] = {"status": status, "reason": reason}
 
 
-def set_status(self, key: InvoiceKey, status: str) -> None:
-if key in self._data:
-self._data[key]["status"] = status
+def update(self, message_id: int, status: str, reason: str = "") -> None:
+if message_id in self.invoices:
+self.invoices[message_id]["status"] = status
+self.invoices[message_id]["reason"] = reason
 
 
-def set_status_msg_id(self, key: InvoiceKey, msg_id: int) -> None:
-if key in self._data:
-self._data[key]["status_msg_id"] = msg_id
+def get(self, message_id: int):
+return self.invoices.get(message_id)
 
 
-def get(self, key: InvoiceKey) -> Optional[Dict[str, object]]:
-return self._data.get(key)
+# глобальный объект для доступа из других файлов
+store = InvoiceStore()
 
 
-STORE = InMemoryStore()
+def store_invoice(message_id: int, status: str = "pending"):
+store.add(message_id, status)
