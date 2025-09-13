@@ -9,7 +9,6 @@ REASON_CB   = "reason"
 PAID_CB     = "paid"
 RECEIVED_CB = "received"
 
-
 def moderation_keyboard(chat_id: int, status_msg_id: int):
     inv = store.get(status_msg_id) or {"status": WAIT}
     st = inv.get("status", WAIT)
@@ -36,3 +35,4 @@ def moderation_keyboard(chat_id: int, status_msg_id: int):
         rows = []  # финал — без кнопок
 
     return InlineKeyboardMarkup(rows) if rows else None
+
