@@ -1,4 +1,4 @@
-# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.2)
+# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.3)
 from __future__ import annotations
 import io
 import os
@@ -29,10 +29,10 @@ def _qr_png_bytes(payload: str) -> bytes:
 def _to_data_uri(b: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
 
-def _guess_mime(file_type: str) -> str:
-    return "image/jpeg" if file_type == "photo" else "application/pdf"
+def _guess_mime_for_photo() -> str:
+    return "image/jpeg"
 
-# ---------- local extractors (fallback) ----------
+# ---------- local extractors ----------
 def _pdf_to_text(file_bytes: bytes) -> str:
     try:
         from PyPDF2 import PdfReader
@@ -97,13 +97,13 @@ def _caption_from_fields(fields: dict) -> str:
 GPT_MODEL = os.getenv("GPT_INVOICE_MODEL", "gpt-4o-mini")
 
 SYSTEM_PROMPT = (
-    "Ты финансовый парсер инвойсов. По входному файлу (PDF/изображение/таблица) найди реквизиты "
-    "для платежного QR по стандарту GOST ST00012 (Россия). Отвечай строго JSON-объектом: "
+    "Ты финансовый парсер инвойсов. Определи реквизиты для платежного QR по стандарту GOST ST00012 (Россия). "
+    "Отвечай строго JSON-объектом: "
     '{"st":"ST00012|Name=...|PersonalAcc=...|BankName=...|BIC=...|CorrespAcc=...|Sum=...|Purpose=...",'
     '"fields":{"Name":"...","PersonalAcc":"...","BankName":"...","BIC":"...","CorrespAcc":"...","Sum":"...","Purpose":"..."},'
     '"notes":"..."} '
-    "Требования: Sum — целое число копеек (напр. 179500 для 1 795,00). "
-    "Purpose должен явно указывать, есть НДС или нет. Если каких-то данных нет в документе — не выдумывай, укажи это в notes."
+    "Требования: Sum — целое число копеек (179500 для 1 795,00). "
+    "Purpose должен явно указывать, есть НДС или нет. Если данных нет в документе — не выдумывай; укажи это в notes."
 )
 
 def _client() -> OpenAI:
@@ -113,7 +113,6 @@ def _client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 def _parse_json(text: str) -> dict:
-    # забираем первый валидный JSON-объект в ответе
     s, e = text.find("{"), text.rfind("}")
     if s == -1 or e == -1 or e <= s:
         raise ValueError("no JSON object found")
@@ -121,24 +120,34 @@ def _parse_json(text: str) -> dict:
 
 async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
     """
-    Возвращает (st_string, fields_dict, notes) либо (None, None, reason)
+    Возвращает (st_string, fields_dict, notes) либо (None, None, reason).
+    ВАЖНО: PDF/Excel отправляем как ТЕКСТ (после локального извлечения), фото — как image_url (data URI).
     """
     try:
         client = _client()
     except Exception as e:
         return None, None, f"OpenAI key/client error: {e}"
 
-    if file_type in ("document", "photo"):
-        mime = _guess_mime(file_type)
+    # Подготовка контента под тип
+    if file_type == "photo":
+        mime = _guess_mime_for_photo()
         data_uri = _to_data_uri(file_bytes, mime)
         user_content = [
-            {"type": "text", "text": "Проанализируй документ и верни JSON как описано."},
+            {"type": "text", "text": "Проанализируй изображение счёта и верни JSON как описано."},
             {"type": "image_url", "image_url": {"url": data_uri}},
         ]
+    elif file_type == "document":
+        # PDF → извлекаем текст и отдаём в GPT как текст
+        txt = _pdf_to_text(file_bytes)
+        user_content = [
+            {"type": "text", "text": "Ниже текст из PDF-счёта. Верни JSON как описано."},
+            {"type": "text", "text": txt[:15000] if txt else ""},
+        ]
     else:
+        # Excel → в текст
         txt = _excel_to_text(file_bytes)
         user_content = [
-            {"type": "text", "text": "Ниже — текстовое представление таблицы. Верни JSON как описано."},
+            {"type": "text", "text": "Ниже текстовое представление таблицы. Верни JSON как описано."},
             {"type": "text", "text": txt[:15000] if txt else ""},
         ]
 
@@ -175,7 +184,7 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
 
     src = inv["src"]
     file_id = src["file_id"]
-    file_type = src["file_type"]
+    file_type = src["file_type"]  # "document" (PDF), "photo", "document/excel->handled as else"
     thread_id = src.get("thread_id")
 
     # 1) качаем файл
@@ -183,7 +192,7 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
     fb = await tg_file.download_as_bytearray()
     b = bytes(fb)
 
-    # 2) GPT → ST00012
+    # 2) GPT → ST00012 (PDF/Excel как текст, фото как image)
     st, fields, notes = await _call_gpt_on_file(b, file_type)
 
     caption = ""
