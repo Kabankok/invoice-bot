@@ -32,8 +32,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(f"Твой user_id: {user.id}")
 
-# --- Обработка файлов ---
-
+# --- Вспомогательное ---
 def _detect_kind(msg) -> str:
     if getattr(msg, "photo", None):
         return "photo"
@@ -44,16 +43,27 @@ def _detect_kind(msg) -> str:
         return "document"
     return "unknown"
 
+# --- Обработка файлов ---
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_in = update.message
     kind = _detect_kind(msg_in)
 
-    sent = await msg_in.reply_text(
-        f"📄 Счёт получен — Ожидает согласования
-Тип: {kind}",
-        reply_markup=moderation_keyboard(msg_in.chat_id, msg_in.message_id)  # временно ставим по входному id
+    text = (
+        "📄 Счёт получен — Ожидает согласования\n"
+        f"Тип: {kind}"
     )
-    # В качестве ключа храним ИД статусного сообщения (бота)
+    # создаём статусное сообщение БОТА (на нём будут кнопки и статус)
+    sent = await msg_in.reply_text(
+        text,
+        reply_markup=moderation_keyboard(msg_in.chat_id, 0)  # временно 0, сейчас перезапишем корректно ниже
+    )
+    # теперь перезапишем клавиатуру с корректным status_msg_id (это id 'sent')
+    await context.bot.edit_message_reply_markup(
+        chat_id=sent.chat_id,
+        message_id=sent.message_id,
+        reply_markup=moderation_keyboard(sent.chat_id, sent.message_id)
+    )
+    # фиксируем запись в хранилище по ИД статусного сообщения БОТА
     store_invoice(sent.message_id, status="WAIT", kind=kind)
 
 # --- Main ---
@@ -78,10 +88,11 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="webhook",
+        url_path="/webhook",
         webhook_url=WEBHOOK_URL,
         drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
     main()
+
