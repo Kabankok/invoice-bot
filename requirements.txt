@@ -2,3 +2,5 @@ python-telegram-bot[webhooks]==21.4
 aiohttp>=3.9
 qrcode
 pillow
+PyPDF2
+openpyxl
