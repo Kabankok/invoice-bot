@@ -1,4 +1,4 @@
-# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR
+# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.1)
 from __future__ import annotations
 import io
 import os
@@ -16,14 +16,8 @@ from store import store
 
 log = logging.getLogger("processor")
 
-# ---------- helpers ----------
 NBSP = "\u00A0"
-
-ST00012_REQUIRED = [
-    "Name", "PersonalAcc", "BankName", "BIC", "CorrespAcc", "Sum", "Purpose"
-]
-
-ST00012_RE = re.compile(r"^ST00012\|(.+)$")
+ST00012_REQUIRED = ["Name", "PersonalAcc", "BankName", "BIC", "CorrespAcc", "Sum", "Purpose"]
 
 def _qr_png_bytes(payload: str) -> bytes:
     img = qrcode.make(payload)
@@ -35,15 +29,12 @@ def _to_data_uri(image_bytes: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 
 def _guess_mime(file_type: str) -> str:
-    # очень грубо; для Telegram типов достаточно
-    if file_type == "photo":
-        return "image/jpeg"
-    return "application/pdf"
+    return "image/jpeg" if file_type == "photo" else "application/pdf"
 
-# ---------- simple extractors for local fallback ----------
+# ---------- local extractors (fallback) ----------
 def _pdf_to_text(file_bytes: bytes) -> str:
     try:
-        from PyPDF2 import PdfReader  # lazy import
+        from PyPDF2 import PdfReader
         r = PdfReader(io.BytesIO(file_bytes))
         chunks = []
         for p in r.pages:
@@ -71,16 +62,13 @@ def _excel_to_text(file_bytes: bytes) -> str:
         log.warning("XLSX extract failed: %s", e)
         return ""
 
-# ---------- GOST builder & validation ----------
+# ---------- validate & caption ----------
 def _validate_st00012(s: str) -> Optional[str]:
-    """Проверяем, что это ST00012 и что есть обязательные поля."""
     if not s or not s.startswith("ST00012|"):
         return "payload is not ST00012"
-    # Быстрая проверка наличия ключей
     fields = {}
     try:
-        parts = s.split("|")[1:]  # без ST00012
-        for p in parts:
+        for p in s.split("|")[1:]:
             if "=" in p:
                 k, v = p.split("=", 1)
                 fields[k] = v
@@ -89,9 +77,8 @@ def _validate_st00012(s: str) -> Optional[str]:
     missing = [k for k in ST00012_REQUIRED if k not in fields or not fields[k].strip()]
     if missing:
         return f"missing fields: {', '.join(missing)}"
-    # Сумма должна быть в копейках (целое число)
     if not re.fullmatch(r"\d+", fields["Sum"]):
-        return "Sum must be integer number of kopecks"
+        return "Sum must be integer (kopecks)"
     return None
 
 def _caption_from_fields(fields: dict) -> str:
@@ -102,50 +89,36 @@ def _caption_from_fields(fields: dict) -> str:
     except Exception:
         amount = "0.00"
     purpose = fields.get("Purpose", "")
-    vat = fields.get("PayeeINN", "")  # если ИНН хотим подсветить; НДС лучше отдавать в Purpose
-    # ожидаем, что GPT включит «НДС …» внутрь Purpose, либо добавит поле VAT
-    vat_text = ""
-    if "VAT=" in purpose.upper() or "НДС" in purpose.upper():
-        vat_text = ""  # уже в назначении
-    return (
-        f"Получатель: {name}\n"
-        f"Сумма: {amount} RUB\n"
-        f"Назначение: {purpose}"
-        f"{'' if not vat_text else f'\\n{vat_text}'}"
-    )
+    return f"Получатель: {name}\nСумма: {amount} RUB\nНазначение: {purpose}"
 
-# ---------- GPT call ----------
-def _gpt_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing")
-    return OpenAI(api_key=api_key)
-
+# ---------- GPT ----------
 GPT_MODEL = os.getenv("GPT_INVOICE_MODEL", "gpt-4o-mini")
-
 INSTRUCTIONS = (
     "Ты финансовый парсер инвойсов. По входному файлу (PDF/изображение/таблица) найди реквизиты "
-    "для платежного QR по стандарту GOST ST00012 (Россия). Верни JSON со строкой ST00012 и разобранными полями. "
-    "Требования:\n"
+    "для платежного QR по стандарту GOST ST00012 (Россия). Верни JSON со строкой ST00012 и разобранными полями.\n"
     "1) Обязательные поля: Name, PersonalAcc, BankName, BIC, CorrespAcc, Sum (в копейках), Purpose.\n"
-    "2) Sum: целое число копеек (напр. 179500 для 1 795,00).\n"
-    "3) Purpose: «Оплата по счёту №… от …, ... НДС …% ...» — укажи явно, есть НДС или нет.\n"
-    "4) Если данных нет в файле — не выдумывай; верни пояснение в 'notes'.\n"
+    "2) Sum — целое число копеек (напр. 179500 для 1 795,00).\n"
+    "3) Purpose: «Оплата по счёту №… от …; НДС …% …» — явно укажи, есть НДС или нет.\n"
+    "4) Если данных нет в файле — не выдумывай; укажи в 'notes'.\n"
     "Формат ответа строго:\n"
     "{\n"
-    "  \"st\": \"ST00012|Name=...|PersonalAcc=...|BankName=...|BIC=...|CorrespAcc=...|Sum=...|Purpose=...\",\n"
-    "  \"fields\": {\"Name\":\"...\",\"PersonalAcc\":\"...\",\"BankName\":\"...\",\"BIC\":\"...\",\"CorrespAcc\":\"...\",\"Sum\":\"...\",\"Purpose\":\"...\"},\n"
-    "  \"notes\": \"...\"\n"
+    '  "st": "ST00012|Name=...|PersonalAcc=...|BankName=...|BIC=...|CorrespAcc=...|Sum=...|Purpose=...",\n'
+    '  "fields": {"Name":"...","PersonalAcc":"...","BankName":"...","BIC":"...","CorrespAcc":"...","Sum":"...","Purpose":"..."},\n'
+    '  "notes": "..." \n'
     "}\n"
 )
 
 async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
-    """
-    Возвращает (st_string, fields_dict, notes) либо (None, None, reason)
-    """
-    client = _gpt_client()
+    """(st_string, fields_dict, notes) либо (None, None, reason)"""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return None, None, "OPENAI_API_KEY is missing"
 
-    # Для PDF/фото пойдём как мультимодал: data:URI
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception as e:
+        return None, None, f"OpenAI client init error: {e}"
+
     if file_type in ("document", "photo"):
         mime = _guess_mime(file_type)
         data_uri = _to_data_uri(file_bytes, mime)
@@ -155,7 +128,6 @@ async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional
             {"type": "image_url", "image_url": {"url": data_uri}},
         ]
     else:
-        # Excel → превратим в текст (быстрый путь) и отдадим GPT на доинтерпретацию
         txt = _excel_to_text(file_bytes)
         content = [
             {"type": "text", "text": INSTRUCTIONS},
@@ -172,9 +144,7 @@ async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional
     except Exception as e:
         return None, None, f"GPT error: {e}"
 
-    # Найдём JSON в ответе
     try:
-        # иногда модель может вернуть префикс/суффикс — попытаемся вычленить { ... }
         start = raw.find("{")
         end = raw.rfind("}")
         data = json.loads(raw[start:end+1])
@@ -184,7 +154,6 @@ async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional
     st = (data.get("st") or "").strip()
     fields = data.get("fields") or {}
     notes = data.get("notes") or ""
-
     return st, fields, notes
 
 # ---------- main entry ----------
@@ -199,15 +168,14 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
     file_type = src["file_type"]
     thread_id = src.get("thread_id")
 
-    # 1) качаем файл из Telegram
+    # 1) качаем файл
     tg_file = await context.bot.get_file(file_id)
     fb = await tg_file.download_as_bytearray()
     b = bytes(fb)
 
-    # 2) зовём GPT → ждём ST00012
+    # 2) GPT → ST00012
     st, fields, notes = await _call_gpt_on_file(b, file_type)
 
-    # 3) валидация; при провале — пытаемся собрать подпись из локального текста
     caption = ""
     if st:
         err = _validate_st00012(st)
@@ -217,7 +185,7 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
     else:
         caption = f"⚠️ GPT не вернул строку ST00012. {notes or ''}".strip()
 
-    # 4) если GPT справился — шлём рабочий QR + нормальную подпись
+    # 3) успех → отправляем рабочий QR
     if st and fields:
         try:
             png = _qr_png_bytes(st)
@@ -229,16 +197,14 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
                 message_thread_id=thread_id if thread_id else None,
                 reply_to_message_id=status_msg_id,
             )
-            log.info("ST00012 QR sent for %s", status_msg_id)
             return
         except Exception as e:
             caption = f"⚠️ Не удалось сгенерировать QR: {e}"
 
-    # 5) fallback: текст из PDF/Excel и демо-QR (не для оплаты) — чтобы не молчать
-    txt = _pdf_to_text(b) if file_type == "document" else (_excel_to_text(b) if file_type != "photo" else "")
+    # 4) fallback: «демо-QR» и пояснение, чтобы админ видел проблему
     demo_payload = "ST00012|Name=ERROR|PersonalAcc=00000000000000000000|BankName=ERROR|BIC=000000000|CorrespAcc=00000000000000000000|Sum=0|Purpose=Parse failed"
     png = _qr_png_bytes(demo_payload)
-    fallback_caption = "Не удалось собрать рабочий QR. Проверьте формат счёта или пришлите образец для обучения."
+    fallback_caption = "Не удалось собрать рабочий QR. Проверьте реквизиты в счёте или пришлите образец для настройки."
     if caption:
         fallback_caption = caption + "\n\n" + fallback_caption
 
@@ -249,3 +215,4 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         message_thread_id=thread_id if thread_id else None,
         reply_to_message_id=status_msg_id,
     )
+
