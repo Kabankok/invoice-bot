@@ -1,4 +1,4 @@
-# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.3)
+# processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR (v2.4 VAT + Excel fix)
 from __future__ import annotations
 import io
 import os
@@ -19,7 +19,7 @@ log = logging.getLogger("processor")
 NBSP = "\u00A0"
 ST00012_REQUIRED = ["Name", "PersonalAcc", "BankName", "BIC", "CorrespAcc", "Sum", "Purpose"]
 
-# ---------- utils ----------
+# ---------------- utils ----------------
 def _qr_png_bytes(payload: str) -> bytes:
     img = qrcode.make(payload)
     buf = io.BytesIO()
@@ -32,7 +32,13 @@ def _to_data_uri(b: bytes, mime: str) -> str:
 def _guess_mime_for_photo() -> str:
     return "image/jpeg"
 
-# ---------- local extractors ----------
+# ---------------- local extractors ----------------
+INV_NUM_RE = re.compile(r"(?:Сч[её]т(?:\s*на\s*оплату)?\s*№\s*([0-9\-]+))", re.IGNORECASE)
+INV_DATE_RE = re.compile(r"от\s*([0-9]{1,2}[.\s][0-9]{1,2}[.\s][0-9]{2,4}|[0-9]{1,2}\s+[А-Яа-яЁёA-Za-z]+?\s+\d{4})")
+VAT_PCT_RE = re.compile(r"(?:НДС|VAT)\s*([0-9]{1,2})\s*%")
+VAT_SUM_RE = re.compile(r"(?:НДС[:\s]|VAT[:\s]).{0,20}?([0-9\s\u00A0]+(?:[.,][0-9]{1,2})?)", re.IGNORECASE)
+TOTAL_RE = re.compile(r"(?:Всего\s*к\s*оплате|Итого|Total).{0,20}?([0-9\s\u00A0]+(?:[.,][0-9]{1,2})?)", re.IGNORECASE)
+
 def _pdf_to_text(file_bytes: bytes) -> str:
     try:
         from PyPDF2 import PdfReader
@@ -63,7 +69,67 @@ def _excel_to_text(file_bytes: bytes) -> str:
         log.warning("XLSX extract failed: %s", e)
         return ""
 
-# ---------- validate & caption ----------
+def _normalize_money(s: str) -> Optional[float]:
+    if not s:
+        return None
+    s = s.replace(NBSP, " ").replace(" ", "")
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        try:
+            return float(s.replace(".", ""))
+        except Exception:
+            return None
+
+def _pre_hint(text: str) -> dict:
+    """
+    Предварительно вытащим подсказки: номер счёта, дата, НДС % и НДС сумма, общий итог.
+    Это повысит стабильность ответа GPT.
+    """
+    t = (text or "").replace(NBSP, " ")
+    inv_num = None
+    inv_date = None
+    vat_pct = None
+    vat_sum = None
+    total = None
+
+    m = INV_NUM_RE.search(t)
+    if m:
+        inv_num = m.group(1).strip()
+
+    m = INV_DATE_RE.search(t)
+    if m:
+        inv_date = m.group(1).strip()
+
+    m = VAT_PCT_RE.search(t)
+    if m:
+        try:
+            vat_pct = int(m.group(1))
+        except Exception:
+            pass
+
+    m = VAT_SUM_RE.search(t)
+    if m:
+        v = _normalize_money(m.group(1))
+        if v is not None:
+            vat_sum = v
+
+    m = TOTAL_RE.search(t)
+    if m:
+        v = _normalize_money(m.group(1))
+        if v is not None:
+            total = v
+
+    return {
+        "invoice_number": inv_num,
+        "invoice_date": inv_date,
+        "vat_percent": vat_pct,
+        "vat_amount": vat_sum,   # в рублях
+        "total": total,          # в рублях
+    }
+
+# ---------------- validate & caption ----------------
 def _validate_st00012(st: str) -> Optional[str]:
     if not st or not st.startswith("ST00012|"):
         return "payload is not ST00012"
@@ -93,17 +159,19 @@ def _caption_from_fields(fields: dict) -> str:
     purpose = fields.get("Purpose", "")
     return f"Получатель: {name}\nСумма: {amount} RUB\nНазначение: {purpose}"
 
-# ---------- GPT (Chat Completions + strict JSON) ----------
+# ---------------- GPT (Chat Completions + strict JSON) ----------------
 GPT_MODEL = os.getenv("GPT_INVOICE_MODEL", "gpt-4o-mini")
 
 SYSTEM_PROMPT = (
-    "Ты финансовый парсер инвойсов. Определи реквизиты для платежного QR по стандарту GOST ST00012 (Россия). "
-    "Отвечай строго JSON-объектом: "
+    "Ты финансовый парсер инвойсов. По входному контенту (текст PDF/таблицы или изображение) найди реквизиты "
+    "для платежного QR по стандарту GOST ST00012 (Россия). Отвечай строго JSON-объектом: "
     '{"st":"ST00012|Name=...|PersonalAcc=...|BankName=...|BIC=...|CorrespAcc=...|Sum=...|Purpose=...",'
     '"fields":{"Name":"...","PersonalAcc":"...","BankName":"...","BIC":"...","CorrespAcc":"...","Sum":"...","Purpose":"..."},'
     '"notes":"..."} '
-    "Требования: Sum — целое число копеек (179500 для 1 795,00). "
-    "Purpose должен явно указывать, есть НДС или нет. Если данных нет в документе — не выдумывай; укажи это в notes."
+    "Требования: Sum — целое число копеек (например, 179500 для 1 795,00). "
+    "Purpose обязательно: если есть НДС — укажи «НДС X% — Y ₽», если нет — «без НДС». "
+    "Если видишь номер и дату счёта, добавь «Оплата по счёту №… от …». "
+    "Не выдумывай данные: если чего-то нет — укажи это в notes."
 )
 
 def _client() -> OpenAI:
@@ -118,36 +186,41 @@ def _parse_json(text: str) -> dict:
         raise ValueError("no JSON object found")
     return json.loads(text[s:e+1])
 
-async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
-    """
-    Возвращает (st_string, fields_dict, notes) либо (None, None, reason).
-    ВАЖНО: PDF/Excel отправляем как ТЕКСТ (после локального извлечения), фото — как image_url (data URI).
-    """
+async def _call_gpt_on_file(file_bytes: bytes, file_type: str, prehint: dict) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
+    """Возвращает (st_string, fields_dict, notes) либо (None, None, reason)."""
     try:
         client = _client()
     except Exception as e:
         return None, None, f"OpenAI key/client error: {e}"
 
-    # Подготовка контента под тип
     if file_type == "photo":
         mime = _guess_mime_for_photo()
         data_uri = _to_data_uri(file_bytes, mime)
         user_content = [
-            {"type": "text", "text": "Проанализируй изображение счёта и верни JSON как описано."},
+            {"type": "text", "text": "Извлеки реквизиты по образу счета и верни JSON как описано ниже."},
+            {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
             {"type": "image_url", "image_url": {"url": data_uri}},
         ]
     elif file_type == "document":
-        # PDF → извлекаем текст и отдаём в GPT как текст
         txt = _pdf_to_text(file_bytes)
         user_content = [
             {"type": "text", "text": "Ниже текст из PDF-счёта. Верни JSON как описано."},
+            {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
+            {"type": "text", "text": txt[:15000] if txt else ""},
+        ]
+    elif file_type == "excel":
+        txt = _excel_to_text(file_bytes)
+        user_content = [
+            {"type": "text", "text": "Ниже текстовое представление Excel-счёта. Верни JSON как описано."},
+            {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
             {"type": "text", "text": txt[:15000] if txt else ""},
         ]
     else:
-        # Excel → в текст
-        txt = _excel_to_text(file_bytes)
+        # safety fallback
+        txt = _pdf_to_text(file_bytes)
         user_content = [
-            {"type": "text", "text": "Ниже текстовое представление таблицы. Верни JSON как описано."},
+            {"type": "text", "text": "Ниже текст из документа. Верни JSON как описано."},
+            {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
             {"type": "text", "text": txt[:15000] if txt else ""},
         ]
 
@@ -175,7 +248,7 @@ async def _call_gpt_on_file(file_bytes: bytes, file_type: str) -> Tuple[Optional
     notes = data.get("notes") or ""
     return st, fields, notes
 
-# ---------- main entry ----------
+# ---------------- main entry ----------------
 async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, status_msg_id: int) -> None:
     inv = store.get(status_msg_id)
     if not inv or not inv.get("src"):
@@ -184,16 +257,24 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
 
     src = inv["src"]
     file_id = src["file_id"]
-    file_type = src["file_type"]  # "document" (PDF), "photo", "document/excel->handled as else"
+    file_type = src["file_type"]   # "document" | "photo" | "excel"
     thread_id = src.get("thread_id")
 
-    # 1) качаем файл
     tg_file = await context.bot.get_file(file_id)
     fb = await tg_file.download_as_bytearray()
     b = bytes(fb)
 
-    # 2) GPT → ST00012 (PDF/Excel как текст, фото как image)
-    st, fields, notes = await _call_gpt_on_file(b, file_type)
+    # предварительные подсказки для GPT
+    base_text = ""
+    if file_type == "document":
+        base_text = _pdf_to_text(b)
+    elif file_type == "excel":
+        base_text = _excel_to_text(b)
+    # для фото подсказки только из регулярных историй по тексту у нас нет (нет OCR), но prehint всё равно передадим пустой
+    prehint = _pre_hint(base_text)
+
+    # GPT → ST00012
+    st, fields, notes = await _call_gpt_on_file(b, file_type, prehint)
 
     caption = ""
     if st:
@@ -204,7 +285,6 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
     else:
         caption = f"⚠️ GPT не вернул ST00012. {notes or ''}".strip()
 
-    # 3) успех → отправляем рабочий QR
     if st and fields:
         try:
             png = _qr_png_bytes(st)
@@ -220,7 +300,7 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         except Exception as e:
             caption = f"⚠️ Не удалось сгенерировать QR: {e}"
 
-    # 4) fallback: демо-QR + пояснение
+    # fallback
     demo_payload = "ST00012|Name=ERROR|PersonalAcc=00000000000000000000|BankName=ERROR|BIC=000000000|CorrespAcc=00000000000000000000|Sum=0|Purpose=Parse failed"
     png = _qr_png_bytes(demo_payload)
     fallback_caption = "Не удалось собрать рабочий QR. Проверьте реквизиты или пришлите образец для настройки."
