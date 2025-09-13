@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main_web.py — Шаг 1.1 (учитываем КАНАЛЫ + /debug)
--------------------------------------------------
-Что изменено/добавлено:
-- Обрабатываем не только группы/супергруппы, но и КАНАЛЫ (channel_post).
-- Ловим файлы из каналов и отвечаем постом в этот же канал (бот должен быть админом канала!).
-- Лучшая диагностика: команда /debug печатает getWebhookInfo (куда сейчас смотрит вебхук).
-- По-прежнему: /start отвечает и в ЛС, и в группах/темах; лог всех апдейтов включён.
-
-Важно: если вам нужны темы/кнопки модерации — используйте супергруппу с темами, а не канал. 
-В каналах тем нет; «комментарии к постам» — это отдельная «Привязанная группа», с ней мы подружим бота на следующих шагах.
+main_web.py — Шаг 1.2 (фикс роутинга вебхука + /debug)
+------------------------------------------------------
+Проблема была в том, что сервер PTB слушал путь по умолчанию ("/<bot_token>"),
+а Telegram присылал POST на "/webhook". Исправляем: явно ставим url_path="/webhook".
+Также убрал лишний ручной set_webhook — теперь вебхук ставится один раз через run_webhook.
 
 requirements.txt:
   python-telegram-bot[webhooks]==21.4
@@ -36,7 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("main_web")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # https://<name>.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # например: https://<name>.onrender.com/webhook
 PORT = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_BOT_TOKEN:
@@ -50,23 +45,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     thread_id = getattr(msg, "message_thread_id", None)
     text = (
-        "Бот на связи ✅\n"
-        "Пришлите PDF/изображение/Excel — отвечу и запишу ID.\n"
+        "Бот на связи ✅
+"
+        "Пришлите PDF/изображение/Excel — отвечу и запишу ID.
+"
         f"(chat_id={chat.id}, thread_id={thread_id})"
     )
-    # Если это обычное сообщение — отвечаем реплаем; если канал — отправляем новым постом
     if hasattr(msg, "reply_text"):
         await msg.reply_text(text)
     else:
-        await context.bot.send_message(chat_id=chat.id, text=text, message_thread_id=thread_id or None)
+        await context.bot.send_message(chat_id=chat.id, text=text)
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     info = await context.bot.get_webhook_info()
+    me = await context.bot.get_me()
     text = (
-        "🔎 Webhook debug:\n"
-        f"url: {info.url or '—'}\n"
-        f"has_custom_certificate: {info.has_custom_certificate}\n"
-        f"pending_update_count: {info.pending_update_count}\n"
+        "🔎 Webhook debug:
+"
+        f"bot: @{me.username} (id={me.id})
+"
+        f"url: {info.url or '—'}
+"
+        f"pending_update_count: {info.pending_update_count}
+"
     )
     msg = update.effective_message or update.channel_post
     chat = update.effective_chat
@@ -90,12 +91,15 @@ async def handle_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         getattr(getattr(msg, 'from_user', None), 'id', None),
         kind,
     )
-
     text = (
-        "✅ Получил файл.\n"
-        f"Тип: {kind}\n"
-        f"chat_id: {chat.id}\n"
-        f"message_thread_id: {thread_id}\n"
+        "✅ Получил файл.
+"
+        f"Тип: {kind}
+"
+        f"chat_id: {chat.id}
+"
+        f"message_thread_id: {thread_id}
+"
         "Это шаг 1 (проверка вебхука). OCR/GPT/QR на следующих шагах."
     )
     await msg.reply_text(text)
@@ -108,12 +112,13 @@ async def handle_file_channel(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     kind = detect_kind_from_message(post)
     log.info("Got FILE(channel_post) | chat_id=%s kind=%s", chat.id, kind)
-
-    # В каналах нет thread_id. Отвечаем новым постом в канал (нужны права администратора).
     text = (
-        "✅ Получил файл в канале.\n"
-        f"Тип: {kind}\n"
-        f"chat_id: {chat.id}\n"
+        "✅ Получил файл в канале.
+"
+        f"Тип: {kind}
+"
+        f"chat_id: {chat.id}
+"
         "Это шаг 1 (webhook OK). Для модерации/кнопок лучше использовать супергруппу с темами."
     )
     await context.bot.send_message(chat_id=chat.id, text=text)
@@ -145,11 +150,6 @@ def detect_kind_from_message(msg) -> str:
 async def _post_init(app):
     me = await app.bot.get_me()
     log.info("Bot getMe: username=@%s id=%s", me.username, me.id)
-    if WEBHOOK_URL:
-        await app.bot.set_webhook(url=WEBHOOK_URL)
-        log.info("Webhook set to: %s", WEBHOOK_URL)
-    else:
-        log.warning("WEBHOOK_URL not set; set it to your Render URL + /webhook")
 
 
 def main() -> None:
@@ -171,7 +171,8 @@ def main() -> None:
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_url=WEBHOOK_URL or None,
+        url_path="/webhook",            # 👈 важный фикс: сервер слушает именно этот путь
+        webhook_url=WEBHOOK_URL or None, # должен совпадать и указывать на .../webhook
         drop_pending_updates=True,
     )
 
