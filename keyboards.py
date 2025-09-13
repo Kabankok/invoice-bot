@@ -12,8 +12,9 @@ def moderation_keyboard(chat_id: int = 0, message_id: int = 0):
 
     keyboard = [
         [
-            InlineKeyboardButton("✔️ Согласовать", callback_data=payload_ok),
-            InlineKeyboardButton("✖️ Отклонить", callback_data=payload_no),
+            InlineKeyboardButton("✅ Согласовать", callback_data=payload_ok),
+            InlineKeyboardButton("❌ Отклонить", callback_data=payload_no),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
+
