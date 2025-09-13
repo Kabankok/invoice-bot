@@ -10,11 +10,13 @@ from keyboards import (
     moderation_keyboard,
     APPROVE_CB, REJECT_CB, REASON_CB, PAID_CB, RECEIVED_CB,
 )
+from processor import on_approved_send_qr
 
 ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
 
 # user_id -> (chat_id, status_msg_id): ожидаем одно текстовое сообщение с причиной
 WAITING_REASON: Dict[int, Tuple[int, int]] = {}
+
 
 def _human_status(code: str) -> str:
     return {
@@ -25,13 +27,16 @@ def _human_status(code: str) -> str:
         RECEIVED: "Получен",
     }.get(code, code)
 
+
 def build_status_text(inv: dict) -> str:
     status = _human_status(inv.get("status", WAIT))
     reason = inv.get("reason") or ""
     lines = ["📄 Счёт", f"Статус: {status}"]
     if inv.get("status") == REJECTED and reason:
         lines.append(f"Причина: {reason}")
-    return "\n".join(lines)
+    return "
+".join(lines)
+
 
 async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -44,18 +49,22 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await q.reply_text("⛔ У вас нет прав на эту операцию.")
         return
 
-    data = (q.data or "").split(":")
-    action = data[0] if data else ""
     chat_id = q.message.chat_id
     status_msg_id = q.message.message_id  # кнопки на статусном сообщении бота
+
+    data = (q.data or "").split(":")
+    action = data[0] if data else ""
 
     inv = store.get(status_msg_id) or {"status": WAIT, "reason": ""}
 
     if action == APPROVE_CB:
         store.set_status(status_msg_id, APPROVED)
+        # сразу отправляем QR (асинхронно)
+        await on_approved_send_qr(context, chat_id=chat_id, status_msg_id=status_msg_id)
     elif action == REJECT_CB:
         store.set_status(status_msg_id, REJECTED)
     elif action == REASON_CB:
+        # ждём одно сообщение от этого же пользователя с текстом причины
         WAITING_REASON[user_id] = (chat_id, status_msg_id)
         await q.message.reply_text("📝 Напишите одной строкой причину отклонения этого счёта.")
         return
@@ -72,6 +81,7 @@ async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         text=build_status_text(inv),
         reply_markup=moderation_keyboard(chat_id, status_msg_id),
     )
+
 
 async def handle_reason_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
