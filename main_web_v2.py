@@ -45,25 +45,33 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой user_id: {user.id}")
 
 # --- Вспомогательное ---
-def _detect_kind(msg) -> str:
+def _detect_kind_and_ftype(msg) -> tuple[str, str]:
+    # kind — человекочитаемый тип, ftype — внутренний для процессора
     if getattr(msg, "photo", None):
-        return "photo"
+        return "photo", "photo"
+
     if getattr(msg, "document", None):
         mt = (msg.document.mime_type or "").lower()
         if mt in {
             "application/vnd.ms-excel",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel.sheet.macroenabled.12",
+            "application/vnd.ms-excel.sheet.binary.macroenabled.12",
         }:
-            return "excel"
-        return "document"
-    return "unknown"
+            return "excel", "excel"
+        if mt in {"application/pdf"}:
+            return "pdf", "document"
+        # по умолчанию: документ, но процессор воспримет как PDF-текст → не идеально
+        return "document", "document"
+
+    return "unknown", "document"
 
 # --- Обработка файлов ---
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_in = update.message
     chat = msg_in.chat
     thread_id = getattr(msg_in, "message_thread_id", None)
-    kind = _detect_kind(msg_in)
+    kind, ftype = _detect_kind_and_ftype(msg_in)
 
     # 1) создаём статусное сообщение БОТА (на нём будут кнопки/статус)
     text = f"""📄 Счёт получен — Ожидает согласования
@@ -76,13 +84,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) привяжем исходный файл к карточке (для шага QR)
     if msg_in.document:
         file_id = msg_in.document.file_id
-        ftype = "document"
     elif msg_in.photo:
         file_id = msg_in.photo[-1].file_id  # максимальное качество
-        ftype = "photo"
     else:
         file_id = ""
-        ftype = "unknown"
 
     store.set_source(
         sent.message_id,
@@ -90,7 +95,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thread_id=thread_id,
         user_msg_id=msg_in.message_id,
         file_id=file_id,
-        file_type=ftype,
+        file_type=ftype,  # <-- тут теперь "excel" / "document" / "photo"
     )
 
     # 4) перерисуем клавиатуру уже с корректным status_msg_id
