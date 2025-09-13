@@ -31,9 +31,9 @@ class InvoiceStore:
     def get(self, status_msg_id: int) -> dict | None:
         return self.invoices.get(status_msg_id)
 
-# совместимость со старым вызовом
 store = InvoiceStore()
 
+# совместимость: создаёт запись и проставляет статус/тип
 def store_invoice(status_msg_id: int, status: str = "WAIT", kind: str = "unknown") -> None:
     store.create(status_msg_id, kind=kind)
     store.set_status(status_msg_id, WAIT if status in ("WAIT", "pending") else status)
