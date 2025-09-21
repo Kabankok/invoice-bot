@@ -8,10 +8,13 @@ Flask>=3.0
 qrcode[pil]>=7.4
 Pillow>=10.0
 python-docx
+pdfminer.six>=20221105
+python-docx>=1.1.0
 qrcode
 pillow
 PyPDF2
 openpyxl
+
 
 
 
