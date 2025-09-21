@@ -3,10 +3,12 @@ aiohttp>=3.9
 httpx==0.27.2
 openai==1.51.0
 PyMuPDF==1.24.10
+xlrd==1.2.0
 qrcode
 pillow
 PyPDF2
 openpyxl
+
 
 
 
