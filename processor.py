@@ -1,10 +1,11 @@
 # processor.py — GPT-разбор инвойса и генерация GOST (ST00012) QR
-# v2.9:
-# - Понятные русские причины отказа (а не "PersonalAcc must be 20 digits").
-# - Предпросмотр распознанных полей в fallback-сообщении.
-# - Автоповтор с более сильной моделью (RETRY_MODEL=gpt-4o), если валидация провалена.
-# - OCR: рендер PDF-сканов при 360 DPI (PyMuPDF), фиксы цифр O→0, I/l→1 и т.д.
-# - Excel: авто-детект xlsx/xls/csv; DOCX поддержан; строгая санитарка и пересборка ST00012.
+# v3.0:
+# - Жёсткая очистка текстовых полей (запрещаем '|' и '='), приведение Sum к копейкам.
+# - OCR фикс цифр (O→0, I/l→1 и т.д.), валидация и понятные русские причины отказа.
+# - DOCX с картинками: извлекаем embedded-изображения и отправляем их в GPT.
+# - PDF-сканы: рендер страниц в PNG (360 DPI).
+# - Excel: авто-детект xlsx/xls/csv.
+# - Автоповтор на более сильной модели при провале валидации (RETRY_MODEL).
 
 from __future__ import annotations
 import io
@@ -28,12 +29,12 @@ NBSP = "\u00A0"
 ST00012_REQUIRED = ["Name", "PersonalAcc", "BankName", "BIC", "CorrespAcc", "Sum", "Purpose"]
 OPTIONAL_FIELDS = ["PayeeINN", "KPP"]
 
-# ---------------- настройки моделей ----------------
+# -------- модели --------
 GPT_MODEL = os.getenv("GPT_INVOICE_MODEL", "gpt-4o-mini")
-RETRY_MODEL = os.getenv("GPT_RETRY_MODEL", "gpt-4o")  # усиленная модель для автоповтора
+RETRY_MODEL = os.getenv("GPT_RETRY_MODEL", "gpt-4o")
 MAX_RETRY_ON_FAIL = int(os.getenv("GPT_MAX_RETRY_ON_FAIL", "1"))
 
-# ---------------- utils ----------------
+# -------- utils --------
 def _qr_png_bytes(payload: str) -> bytes:
     img = qrcode.make(payload)
     buf = io.BytesIO()
@@ -50,7 +51,7 @@ def _digits_only(s: str) -> str:
     return re.sub(r"\D+", "", s or "")
 
 def _ocr_digit_fix(s: str) -> str:
-    """Подправляем частые OCR-ошибки в числовых строках: O→0, o→0, I/l→1, B→8, S→5, Z→2."""
+    """Частые OCR-замены в числовых полях: O→0, I/l→1, B→8, S→5, Z→2."""
     if not isinstance(s, str):
         return s
     table = str.maketrans({
@@ -64,20 +65,36 @@ def _ocr_digit_fix(s: str) -> str:
 
 def _sanitize_fields(fields: dict) -> dict:
     f = dict(fields or {})
+
+    # числовые поля — OCR фиксы → только цифры
     for k in ["PersonalAcc", "CorrespAcc", "BIC", "Sum", "PayeeINN", "KPP"]:
         if k in f and isinstance(f[k], str):
-            f[k] = _ocr_digit_fix(f[k])
-            f[k] = _digits_only(f[k])
+            v = _ocr_digit_fix(f[k])
+            v = _digits_only(v)
+            f[k] = v
+
+    # текстовые поля — запрещаем | и =, схлопываем пробелы
+    def clean_text(s: str) -> str:
+        s = s.replace(NBSP, " ")
+        s = s.replace("«", '"').replace("»", '"')
+        s = s.replace("|", " ").replace("=", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
     if "Purpose" in f and isinstance(f["Purpose"], str):
-        p = f["Purpose"].replace(NBSP, " ").strip()
-        p = re.sub(r"\s+", " ", p)
-        p = p.replace("«", '"').replace("»", '"')
-        f["Purpose"] = p
+        f["Purpose"] = clean_text(f["Purpose"])
     for k in ["Name", "BankName"]:
         if k in f and isinstance(f[k], str):
-            s = f[k].replace(NBSP, " ").replace("«", '"').replace("»", '"').strip()
-            s = re.sub(r"\s+", " ", s)
-            f[k] = s
+            f[k] = clean_text(f[k])
+
+    # Sum — финально к копейкам, если прилетело в рублях
+    if f.get("Sum") and not f["Sum"].isdigit():
+        rub = re.sub(r"[^\d,\.]", "", f["Sum"]).replace(",", ".")
+        try:
+            f["Sum"] = str(int(round(float(rub) * 100)))
+        except Exception:
+            f["Sum"] = _digits_only(f["Sum"])
+
     return f
 
 def _build_st00012_from_fields(fields: dict) -> str:
@@ -120,7 +137,7 @@ def _fields_preview(fields: dict) -> str:
     take("Purpose", "Назначение")
     return "\n".join(show)
 
-# ---------------- signatures/helpers ----------------
+# -------- сигнатуры/помощники --------
 def _is_pdf(b: bytes) -> bool:
     return b[:4] == b"%PDF"
 
@@ -130,7 +147,9 @@ def _is_xlsx_zip(b: bytes) -> bool:
 def _is_xls_ole(b: bytes) -> bool:
     return b[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
 
-# ---------------- local extractors ----------------
+# -------- локальные извлечения --------
+import io as _io
+
 INV_NUM_RE  = re.compile(r"(?:Сч[её]т(?:\s*на\s*оплату)?\s*№\s*([0-9\-]+))", re.IGNORECASE)
 INV_DATE_RE = re.compile(r"от\s*([0-9]{1,2}[.\s][0-9]{1,2}[.\s][0-9]{2,4}|[0-9]{1,2}\s+[А-Яа-яЁёA-Za-z]+?\s+\d{4})")
 VAT_PCT_RE  = re.compile(r"(?:НДС|VAT)\s*([0-9]{1,2})\s*%")
@@ -250,6 +269,22 @@ def _docx_to_text(file_bytes: bytes) -> str:
         log.warning("DOCX extract failed: %s", e)
         return ""
 
+def _docx_images(file_bytes: bytes, max_images: int = 5) -> List[bytes]:
+    imgs = []
+    try:
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            media_files = [n for n in z.namelist() if n.lower().startswith("word/media/")]
+            for n in media_files:
+                if n.lower().endswith((".png", ".jpg", ".jpeg")):
+                    with z.open(n) as f:
+                        imgs.append(f.read())
+                        if len(imgs) >= max_images:
+                            break
+    except Exception as e:
+        log.warning("DOCX images extract failed: %s", e)
+    return imgs
+
 def _normalize_money(s: str) -> Optional[float]:
     if not s:
         return None
@@ -297,7 +332,7 @@ def _pre_hint(text: str) -> dict:
         "total": total,
     }
 
-# ---------------- validate & caption ----------------
+# -------- валидация/подписи --------
 def _validate_st00012(st: str) -> Optional[str]:
     if not st or not st.startswith("ST00012|"):
         return "payload is not ST00012"
@@ -335,7 +370,6 @@ def _validate_st00012(st: str) -> Optional[str]:
     return None
 
 def _reason_human(code: str, st_fields: dict | None, fields_src: dict | None) -> str:
-    # дружелюбное описание причины на русском
     if not code:
         return ""
     if code.startswith("missing:"):
@@ -381,14 +415,13 @@ def _caption_from_fields(fields: dict, notes: str = "") -> str:
     if fields.get("KPP"):
         extra.append(f"КПП: {fields['KPP']}")
     if notes:
-        # укорачиваем заметки, чтобы не раздувать подпись
         n = notes.strip()
         if len(n) > 300: n = n[:297] + "..."
         extra.append(f"Примечание: {n}")
     tail = ("\n" + "\n".join(extra)) if extra else ""
     return f"Получатель: {name}\nСумма: {amount} RUB\nНазначение: {purpose}{tail}"
 
-# ---------------- GPT ----------------
+# -------- GPT --------
 SYSTEM_PROMPT = (
     "Ты финансовый парсер инвойсов. По входному контенту (текст PDF/таблицы/документа или изображения страниц) "
     "найди реквизиты для платежного QR по стандарту GOST ST00012 (Россия). Отвечай строго JSON-объектом: "
@@ -400,7 +433,7 @@ SYSTEM_PROMPT = (
     "Purpose обязательно: если есть НДС — укажи «НДС X% — Y ₽», если нет — «без НДС». "
     "Если видишь номер и дату счёта, добавь «Оплата по счёту №… от …». "
     "Не выдумывай данные: если чего-то нет в документе — оставь пустым и распиши в notes. "
-    "Все номера счетов/БИК должны быть выведены цифрами без пробелов, длины: PersonalAcc=20, CorrespAcc=20, BIC=9."
+    "Все номера счетов/БИК выводи цифрами без пробелов: PersonalAcc=20, CorrespAcc=20, BIC=9."
 )
 
 def _client() -> OpenAI:
@@ -434,15 +467,15 @@ async def _call_gpt_on_file(
             {"type": "image_url", "image_url": {"url": data_uri}},
         ]
     elif file_type == "document":
-        txt = _pdf_to_text(file_bytes) if _is_pdf(file_bytes) else ""
-        if txt and txt.strip():
-            user_content = [
-                {"type": "text", "text": "Ниже текст документа (PDF). Верни JSON как описано."},
-                {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
-                {"type": "text", "text": txt[:15000]},
-            ]
-        else:
-            if _is_pdf(file_bytes):
+        if _is_pdf(file_bytes):
+            txt = _pdf_to_text(file_bytes)
+            if txt and txt.strip():
+                user_content = [
+                    {"type": "text", "text": "Ниже текст документа (PDF). Верни JSON как описано."},
+                    {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
+                    {"type": "text", "text": txt[:15000]},
+                ]
+            else:
                 images = _pdf_to_images(file_bytes, max_pages=3, dpi=360)
                 if not images:
                     return None, None, "PDF is a scan and could not be rendered to images"
@@ -452,17 +485,27 @@ async def _call_gpt_on_file(
                 ]
                 for img in images:
                     user_content.append({"type": "image_url", "image_url": {"url": _to_data_uri(img, "image/png")}})
+        else:
+            # DOCX
+            if docx_text and docx_text.strip():
+                user_content = [
+                    {"type": "text", "text": "Ниже текст из DOCX. Верни JSON как описано."},
+                    {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
+                    {"type": "text", "text": docx_text[:15000]},
+                ]
             else:
-                # если это не PDF-документ, попробуем как DOCX-текст
-                if docx_text and docx_text.strip():
+                images = _docx_images(file_bytes, max_images=5)
+                if images:
                     user_content = [
-                        {"type": "text", "text": "Ниже текст из DOCX. Верни JSON как описано."},
+                        {"type": "text", "text": "DOCX содержит изображения счёта. Проанализируй картинки и верни JSON как описано."},
                         {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
-                        {"type": "text", "text": docx_text[:15000]},
                     ]
+                    for img in images:
+                        mime = "image/png" if img[:8].startswith(b"\x89PNG") else "image/jpeg"
+                        user_content.append({"type": "image_url", "image_url": {"url": _to_data_uri(img, mime)}})
                 else:
                     user_content = [
-                        {"type": "text", "text": "Текст документа не извлечён. Верни JSON как описано, если возможно."},
+                        {"type": "text", "text": "Текст/изображения из DOCX не извлечены. Верни JSON как описано, если возможно."},
                         {"type": "text", "text": f"Подсказки (если релевантны): {json.dumps(prehint, ensure_ascii=False)}"},
                     ]
     elif file_type == "excel":
@@ -504,7 +547,7 @@ async def _call_gpt_on_file(
     notes = data.get("notes") or ""
     return st, fields, notes
 
-# ---------------- main entry ----------------
+# -------- main entry --------
 async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, status_msg_id: int) -> None:
     inv = store.get(status_msg_id)
     if not inv or not inv.get("src"):
@@ -520,6 +563,7 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
     fb = await tg_file.download_as_bytearray()
     b = bytes(fb)
 
+    # Подсказки для GPT
     base_text = ""
     docx_text = ""
     if file_type == "document":
@@ -532,14 +576,12 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         base_text = _excel_to_text(b)
     prehint = _pre_hint(base_text)
 
-    # 1-я попытка: текущая модель
+    # 1-я попытка
     st, fields, notes = await _call_gpt_on_file(b, file_type, prehint, docx_text=docx_text, model=GPT_MODEL)
 
-    # Санитарка + фиксы цифр
     if fields:
         fields = _sanitize_fields(fields)
 
-    # Пересборка st, если пустой/кривой
     if (not st or not st.startswith("ST00012|")) and fields:
         if "Sum" in fields and fields["Sum"] and not fields["Sum"].isdigit():
             rub = re.sub(r"[^\d,\.]", "", fields["Sum"]).replace(",", ".")
@@ -549,10 +591,9 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
                 pass
         st = _build_st00012_from_fields(fields)
 
-    # Проверка
     err_code = _validate_st00012(st) if st else "payload is not ST00012"
 
-    # Автоповтор с более сильной моделью, если надо
+    # автоповтор
     retries_left = MAX_RETRY_ON_FAIL if GPT_MODEL != RETRY_MODEL else 0
     while err_code and retries_left > 0:
         retries_left -= 1
@@ -568,12 +609,12 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
                     pass
             st2 = _build_st00012_from_fields(fields2)
         err2 = _validate_st00012(st2) if st2 else "payload is not ST00012"
-        # Если новая попытка лучше — используем её
+        # берём лучший вариант
         if not err2 or (err2 and st2 and fields2 and len(_fields_preview(fields2)) > len(_fields_preview(fields or {}))):
             st, fields, notes, err_code = st2, fields2, notes2, err2
             break
 
-    # Успех → отправляем QR
+    # успех
     if not err_code and st and fields:
         try:
             png = _qr_png_bytes(st)
@@ -589,11 +630,11 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         except Exception as e:
             err_code = f"Не удалось сгенерировать QR: {e}"
 
-    # Fallback c русским объяснением и предпросмотром полей
+    # fallback с причинами и предпросмотром
     reason = _reason_human(err_code, None, fields)
     preview = _fields_preview(fields or {})
     reason_block = f"\nПричина: {reason}" if reason else ""
-    preview_block = f"\n\nРаспознанные поля (проверьте внимательнее):\n{preview}" if preview else ""
+    preview_block = f"\n\nРаспознанные поля (проверьте):\n{preview}" if preview else ""
 
     demo_payload = "ST00012|Name=ERROR|PersonalAcc=00000000000000000000|BankName=ERROR|BIC=000000000|CorrespAcc=00000000000000000000|Sum=0|Purpose=Parse failed"
     png = _qr_png_bytes(demo_payload)
@@ -609,3 +650,4 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         message_thread_id=thread_id if thread_id else None,
         reply_to_message_id=status_msg_id,
     )
+
