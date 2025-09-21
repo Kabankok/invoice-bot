@@ -1,135 +1,147 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-from __future__ import annotations
+# main_web_v2.py — Telegram webhook-приложение (python-telegram-bot 21.4)
+# Работает только в заданной теме форума (forum topic) по env:
+#   ALLOWED_CHAT_ID=-1002904857758
+#   ALLOWED_TOPIC_ID=4
+# И использует модерацию/процессор для генерации QR.
+
 import os
 import logging
-from telegram import Update
+from typing import Optional
+
+from telegram import Update, Document, Message
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters
 )
 
-from store import store_invoice, store
 from keyboards import moderation_keyboard
 from moderation import handle_moderation, handle_reason_message
+from store import store
+from processor import on_approved_send_qr
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-log = logging.getLogger("main_web_v2")
+log = logging.getLogger("main_web")
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-PORT = int(os.environ.get("PORT", "10000"))
+TOKEN = os.getenv("BOT_TOKEN", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # например https://invoice-bot-xxx.onrender.com/webhook
+PORT = int(os.getenv("PORT", "10000"))
 
-if not TOKEN:
-    raise SystemExit("TELEGRAM_BOT_TOKEN is missing")
-if not WEBHOOK_URL:
-    raise SystemExit("WEBHOOK_URL is missing (e.g. https://<name>.onrender.com/webhook)")
+# Ограничение области работы (только эта тема)
+ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))     # например -1002904857758
+ALLOWED_TOPIC_ID = int(os.getenv("ALLOWED_TOPIC_ID", "0"))   # например 4
 
-# --- Команды ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(f"Привет, {user.first_name}! Бот на связи ✅")
+def _allowed_topic(update: Update) -> bool:
+    msg: Optional[Message] = update.effective_message
+    if not msg:
+        return False
+    chat = update.effective_chat
+    if not chat:
+        return False
+    cid = chat.id
+    tid = msg.message_thread_id  # None для обычных чатов/PM
+    if ALLOWED_CHAT_ID and cid != ALLOWED_CHAT_ID:
+        return False
+    if ALLOWED_TOPIC_ID and tid != ALLOWED_TOPIC_ID:
+        return False
+    return True
 
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Webhook: {WEBHOOK_URL}")
+# ---------- helpers ----------
+def _detect_file_type(doc: Document) -> str:
+    # document | excel
+    name = (doc.file_name or "").lower()
+    mt = (doc.mime_type or "").lower()
+    if name.endswith((".xlsx", ".xls", ".csv")) or ("excel" in mt):
+        return "excel"
+    return "document"
 
-async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(f"Твой user_id: {user.id}")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # В личке отвечаем; в группе — только если внутри разрешённой темы
+    if update.effective_chat and update.effective_chat.type == "private":
+        await update.message.reply_text("Бот на связи ✅\nПришлите счёт в нужной теме группы.")
+        return
+    if not _allowed_topic(update):
+        return
+    await update.message.reply_text("Бот на связи в этой теме ✅")
 
-# --- Вспомогательное ---
-def _detect_kind_and_ftype(msg) -> tuple[str, str]:
-    # kind — человекочитаемый тип, ftype — внутренний для процессора
-    if getattr(msg, "photo", None):
-        return "photo", "photo"
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_topic(update):
+        return
+    msg = update.effective_message
+    photo = msg.photo[-1]
+    file = await context.bot.get_file(photo.file_id)  # не скачиваем сейчас
+    # ставим статус и кнопки
+    text = "📄 Счёт получен — Ожидает согласования"
+    m = await msg.reply_text(text, reply_markup=moderation_keyboard(), reply_to_message_id=msg.message_id)
+    # сохраняем источник
+    store.put(m.message_id, {
+        "src": {
+            "file_id": photo.file_id,
+            "file_type": "photo",
+            "thread_id": msg.message_thread_id
+        }
+    })
 
-    if getattr(msg, "document", None):
-        mt = (msg.document.mime_type or "").lower()
-        if mt in {
-            "application/vnd.ms-excel",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "application/vnd.ms-excel.sheet.macroenabled.12",
-            "application/vnd.ms-excel.sheet.binary.macroenabled.12",
-        }:
-            return "excel", "excel"
-        if mt in {"application/pdf"}:
-            return "pdf", "document"
-        # по умолчанию: документ, но процессор воспримет как PDF-текст → не идеально
-        return "document", "document"
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_topic(update):
+        return
+    msg = update.effective_message
+    doc = msg.document
+    if not doc:
+        return
+    file_type = _detect_file_type(doc)
+    text = "📄 Счёт получен — Ожидает согласования"
+    m = await msg.reply_text(text, reply_markup=moderation_keyboard(), reply_to_message_id=msg.message_id)
+    store.put(m.message_id, {
+        "src": {
+            "file_id": doc.file_id,
+            "file_type": file_type,
+            "thread_id": msg.message_thread_id
+        }
+    })
 
-    return "unknown", "document"
+# moderation (approve/decline + причины)
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_topic(update):
+        return
+    await handle_moderation(update, context)
 
-# --- Обработка файлов ---
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg_in = update.message
-    chat = msg_in.chat
-    thread_id = getattr(msg_in, "message_thread_id", None)
-    kind, ftype = _detect_kind_and_ftype(msg_in)
+async def on_reason_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Сообщение-пояснение по причине отказа (мы помечаем пользователя в moderation.py)
+    if not _allowed_topic(update):
+        return
+    await handle_reason_message(update, context)
 
-    # 1) создаём статусное сообщение БОТА (на нём будут кнопки/статус)
-    text = f"""📄 Счёт получен — Ожидает согласования
-Тип: {kind}"""
-    sent = await msg_in.reply_text(text, reply_markup=moderation_keyboard(chat.id, 0))
+def main() -> None:
+    if not TOKEN or not WEBHOOK_URL:
+        raise RuntimeError("BOT_TOKEN or WEBHOOK_URL is not set")
 
-    # 2) фиксируем запись в хранилище по ИД статусного сообщения БОТА
-    store_invoice(sent.message_id, status="WAIT", kind=kind)
-
-    # 3) привяжем исходный файл к карточке (для шага QR)
-    if msg_in.document:
-        file_id = msg_in.document.file_id
-    elif msg_in.photo:
-        file_id = msg_in.photo[-1].file_id  # максимальное качество
-    else:
-        file_id = ""
-
-    store.set_source(
-        sent.message_id,
-        chat_id=chat.id,
-        thread_id=thread_id,
-        user_msg_id=msg_in.message_id,
-        file_id=file_id,
-        file_type=ftype,  # <-- тут теперь "excel" / "document" / "photo"
-    )
-
-    # 4) перерисуем клавиатуру уже с корректным status_msg_id
-    await context.bot.edit_message_reply_markup(
-        chat_id=sent.chat_id,
-        message_id=sent.message_id,
-        reply_markup=moderation_keyboard(sent.chat_id, sent.message_id),
-    )
-
-# --- Main ---
-def main():
     app = Application.builder().token(TOKEN).build()
 
     # команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("debug", debug))
-    app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("start", start_cmd))
 
-    # файлы
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    # документы и фото
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
     # кнопки модерации
-    app.add_handler(CallbackQueryHandler(handle_moderation))
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-    # приём причины отклонения
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason_message))
+    # текстовые пояснения (после "Отклонить → Указать причину")
+    # фильтр — обычный текст (в moderation.py вы отмечаете ожидание причины на пользователя)
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_reason_text))
 
-    # запуск вебхука
+    # запуск webhook
+    log.info("Setting webhook to: %s", WEBHOOK_URL)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="/webhook",
         webhook_url=WEBHOOK_URL,
         drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
     )
 
 if __name__ == "__main__":
