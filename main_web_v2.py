@@ -1,148 +1,202 @@
-# main_web_v2.py — Telegram webhook-приложение (python-telegram-bot 21.4)
-# Работает только в заданной теме форума (forum topic) по env:
-#   ALLOWED_CHAT_ID=-1002904857758
-#   ALLOWED_TOPIC_ID=4
-# И использует модерацию/процессор для генерации QR.
+# main_web_v2.py
+# -----------------------------
+# 1) Универсальный вебхук Telegram: /webhook и /webhook/<secret>
+# 2) Health-check: /healthz
+# 3) Авто-установка вебхука при старте (если задан WEBHOOK_URL)
+# 4) Фильтры ALLOWED_CHAT_ID / ALLOWED_TOPIC_ID
+# 5) Мини-обработчик входящих сообщений/документов (для проверки трафика)
+# -----------------------------
 
 import os
+import json
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from telegram import Update, Document, Message
-from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-    MessageHandler, filters
-)
+from flask import Flask, request, abort, jsonify
+from urllib.parse import urlencode
+import urllib.request
 
-from keyboards import moderation_keyboard
-from moderation import handle_moderation, handle_reason_message
-from store import store
-from processor import on_approved_send_qr
-
+# ---------- ЛОГИ ----------
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
-log = logging.getLogger("main_web")
+log = logging.getLogger("tg-webhook")
 
-TOKEN = os.getenv("BOT_TOKEN", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # например https://invoice-bot-xxx.onrender.com/webhook
-PORT = int(os.getenv("PORT", "10000"))
+# ---------- ENV ----------
+def get_env() -> Dict[str, str]:
+    # Поддерживаем и BOT_TOKEN, и TELEGRAM_BOT_TOKEN (чтобы не менять Render)
+    bot_token = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    webhook_url = (os.getenv("WEBHOOK_URL") or "").strip()
+    webhook_secret = (os.getenv("WEBHOOK_SECRET") or "").strip()
 
-# Ограничение области работы (только эта тема)
-ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))     # например -1002904857758
-ALLOWED_TOPIC_ID = int(os.getenv("ALLOWED_TOPIC_ID", "0"))   # например 4
+    allowed_chat_id = (os.getenv("ALLOWED_CHAT_ID") or "").strip()
+    allowed_topic_id = (os.getenv("ALLOWED_TOPIC_ID") or "").strip()
 
-def _allowed_topic(update: Update) -> bool:
-    msg: Optional[Message] = update.effective_message
+    if not bot_token:
+        raise RuntimeError("Не задан BOT_TOKEN (или TELEGRAM_BOT_TOKEN) в переменных окружения.")
+
+    # WEBHOOK_URL НЕ обязателен для старта сервера — но без него авто-настройка вебхука не выполнится.
+    return {
+        "BOT_TOKEN": bot_token,
+        "WEBHOOK_URL": webhook_url,
+        "WEBHOOK_SECRET": webhook_secret,
+        "ALLOWED_CHAT_ID": allowed_chat_id,
+        "ALLOWED_TOPIC_ID": allowed_topic_id,
+    }
+
+ENV = get_env()
+
+# ---------- UTILS ----------
+def tg_api_request(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Вызов Telegram Bot API без внешних библиотек.
+    """
+    url = f"https://api.telegram.org/bot{ENV['BOT_TOKEN']}/{method}"
+    body = urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8")
+        try:
+            return json.loads(raw)
+        except Exception:
+            log.error("TG API invalid JSON: %s", raw)
+            return {"ok": False, "raw": raw}
+
+def set_webhook_if_needed() -> None:
+    """
+    Если задан WEBHOOK_URL — пытаемся зарегистрировать вебхук в Telegram.
+    """
+    if not ENV["WEBHOOK_URL"]:
+        log.info("WEBHOOK_URL не задан — пропускаю установку вебхука (сервер всё равно поднят).")
+        return
+
+    # Если используем secret-путь, проверим, что URL действительно содержит его.
+    if ENV["WEBHOOK_SECRET"]:
+        if not ENV["WEBHOOK_URL"].rstrip("/").endswith(f"/{ENV['WEBHOOK_SECRET']}"):
+            log.warning(
+                "WEBHOOK_SECRET задан, но WEBHOOK_URL не заканчивается на '/%s'. "
+                "Рекомендуется сделать URL вида .../webhook/%s",
+                ENV["WEBHOOK_SECRET"], ENV["WEBHOOK_SECRET"]
+            )
+
+    log.info("Настраиваю вебхук Telegram: %s", ENV["WEBHOOK_URL"])
+    res = tg_api_request("setWebhook", {"url": ENV["WEBHOOK_URL"]})
+    if not res.get("ok"):
+        log.error("Не удалось установить вебхук: %s", res)
+    else:
+        log.info("Вебхук установлен: %s", res)
+
+def send_text(chat_id: int, text: str, message_thread_id: Optional[int] = None) -> None:
+    payload = {"chat_id": chat_id, "text": text}
+    if message_thread_id:
+        payload["message_thread_id"] = message_thread_id
+    tg_api_request("sendMessage", payload)
+
+def passes_filters(msg: Dict[str, Any]) -> bool:
+    """
+    Фильтруем по ALLOWED_CHAT_ID / ALLOWED_TOPIC_ID, если заданы.
+    """
     if not msg:
         return False
-    chat = update.effective_chat
-    if not chat:
+
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+
+    # Для тем (топиков) в супергруппах
+    topic_id = msg.get("message_thread_id")
+    topic_id_str = str(topic_id) if topic_id is not None else ""
+
+    allowed_chat_id = ENV["ALLOWED_CHAT_ID"]
+    allowed_topic_id = ENV["ALLOWED_TOPIC_ID"]
+
+    if allowed_chat_id and chat_id != allowed_chat_id:
         return False
-    cid = chat.id
-    tid = msg.message_thread_id  # None для обычных чатов/PM
-    if ALLOWED_CHAT_ID and cid != ALLOWED_CHAT_ID:
-        return False
-    if ALLOWED_TOPIC_ID and tid != ALLOWED_TOPIC_ID:
-        return False
+    if allowed_topic_id:
+        # Если фильтруем по теме — требуем совпадение ID темы
+        if topic_id_str != allowed_topic_id:
+            return False
     return True
 
-# ---------- helpers ----------
-def _detect_file_type(doc: Document) -> str:
-    # document | excel
-    name = (doc.file_name or "").lower()
-    mt = (doc.mime_type or "").lower()
-    if name.endswith((".xlsx", ".xls", ".csv")) or ("excel" in mt):
-        return "excel"
-    return "document"
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # В личке отвечаем; в группе — только если внутри разрешённой темы
-    if update.effective_chat and update.effective_chat.type == "private":
-        await update.message.reply_text("Бот на связи ✅\nПришлите счёт в нужной теме группы.")
+def handle_update(update: Dict[str, Any]) -> None:
+    """
+    Мини-обработчик: только логируем и отправляем короткий ответ,
+    чтобы проверить сквозную связку Telegram → Render → Telegram.
+    """
+    message = update.get("message") or update.get("edited_message") or {}
+    if not message:
+        log.info("Нет поля message в апдейте — пропускаю.")
         return
-    if not _allowed_topic(update):
+
+    if not passes_filters(message):
+        log.info("Сообщение отфильтровано по ALLOWED_*")
         return
-    await update.message.reply_text("Бот на связи в этой теме ✅")
 
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed_topic(update):
+    chat = message["chat"]
+    chat_id = int(chat["id"])
+    thread_id = message.get("message_thread_id")  # для тем
+
+    # Определяем тип входящего
+    if "document" in message:
+        doc = message["document"]
+        file_name = doc.get("file_name", "document")
+        log.info("Получен document: %s", file_name)
+        send_text(chat_id, f"✅ Файл получен: {file_name}. Обработка включена.", thread_id)
         return
-    msg = update.effective_message
-    photo = msg.photo[-1]
-    file = await context.bot.get_file(photo.file_id)  # не скачиваем сейчас
-    # ставим статус и кнопки
-    text = "📄 Счёт получен — Ожидает согласования"
-    m = await msg.reply_text(text, reply_markup=moderation_keyboard(), reply_to_message_id=msg.message_id)
-    # сохраняем источник
-    store.put(m.message_id, {
-        "src": {
-            "file_id": photo.file_id,
-            "file_type": "photo",
-            "thread_id": msg.message_thread_id
-        }
-    })
-
-async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed_topic(update):
+    elif "text" in message:
+        txt = message["text"]
+        log.info("Получен текст: %s", txt)
+        send_text(chat_id, "👋 Бот на связи. Отправь PDF/DOCX как файл (скрепкой).", thread_id)
         return
-    msg = update.effective_message
-    doc = msg.document
-    if not doc:
+    else:
+        log.info("Получен апдейт не поддерживаемого типа: ключи=%s", list(message.keys()))
+        send_text(chat_id, "Я пока принимаю текст и документы (PDF/DOCX).", thread_id)
         return
-    file_type = _detect_file_type(doc)
-    text = "📄 Счёт получен — Ожидает согласования"
-    m = await msg.reply_text(text, reply_markup=moderation_keyboard(), reply_to_message_id=msg.message_id)
-    store.put(m.message_id, {
-        "src": {
-            "file_id": doc.file_id,
-            "file_type": file_type,
-            "thread_id": msg.message_thread_id
-        }
-    })
 
-# moderation (approve/decline + причины)
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _allowed_topic(update):
-        return
-    await handle_moderation(update, context)
+# ---------- APP ----------
+app = Flask(__name__)
 
-async def on_reason_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Сообщение-пояснение по причине отказа (мы помечаем пользователя в moderation.py)
-    if not _allowed_topic(update):
-        return
-    await handle_reason_message(update, context)
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
 
-def main() -> None:
-    if not TOKEN or not WEBHOOK_URL:
-        raise RuntimeError("BOT_TOKEN or WEBHOOK_URL is not set")
+# Принимаем и /webhook, и /webhook/<secret>
+@app.route("/webhook", methods=["GET", "POST"])
+@app.route("/webhook/<secret>", methods=["GET", "POST"])
+def webhook(secret: Optional[str] = None):
+    # Если задан секрет — проверяем
+    if ENV["WEBHOOK_SECRET"]:
+        if secret is None or secret != ENV["WEBHOOK_SECRET"]:
+            # GET/POST по "неправильному" URL — 403, чтобы было видно, что маршрут живой, но секрет не тот.
+            return "forbidden", 403
 
-    app = Application.builder().token(TOKEN).build()
+    if request.method == "GET":
+        # Telegram использует POST, но GET держим для быстрой проверки в браузере.
+        return "ok", 200
 
-    # команды
-    app.add_handler(CommandHandler("start", start_cmd))
+    # POST — это от Telegram
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        log.exception("Не удалось распарсить JSON")
+        return jsonify({"ok": False, "error": "invalid json"}), 400
 
-    # документы и фото
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    log.info("Incoming update: %s", json.dumps(update)[:2000])
+    try:
+        handle_update(update)
+    except Exception:
+        log.exception("Ошибка в обработке апдейта")
+        return jsonify({"ok": False}), 500
 
-    # кнопки модерации
-    app.add_handler(CallbackQueryHandler(on_callback))
+    return jsonify({"ok": True}), 200
 
-    # текстовые пояснения (после "Отклонить → Указать причину")
-    # фильтр — обычный текст (в moderation.py вы отмечаете ожидание причины на пользователя)
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_reason_text))
+def main():
+    # Пытаемся выставить вебхук (если задан WEBHOOK_URL)
+    set_webhook_if_needed()
 
-    # запуск webhook
-    log.info("Setting webhook to: %s", WEBHOOK_URL)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=WEBHOOK_URL,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
+
