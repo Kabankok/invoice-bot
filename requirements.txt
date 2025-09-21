@@ -4,11 +4,13 @@ httpx==0.27.2
 openai==1.51.0
 PyMuPDF==1.24.10
 xlrd==1.2.0
+Flask>=3.0
 python-docx
 qrcode
 pillow
 PyPDF2
 openpyxl
+
 
 
 
