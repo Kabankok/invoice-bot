@@ -8,6 +8,7 @@
 # - Автоповтор на более сильной модели при провале валидации (RETRY_MODEL).
 
 from __future__ import annotations
+import asyncio
 import io
 import os
 import re
@@ -28,6 +29,27 @@ log = logging.getLogger("processor")
 NBSP = "\u00A0"
 ST00012_REQUIRED = ["Name", "PersonalAcc", "BankName", "BIC", "CorrespAcc", "Sum", "Purpose"]
 OPTIONAL_FIELDS = ["PayeeINN", "KPP"]
+
+PHOTO_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
+    ".heic",
+    ".heif",
+)
+
+EXCEL_EXTENSIONS = (
+    ".xls",
+    ".xlsx",
+    ".xlsm",
+    ".csv",
+    ".tsv",
+)
 
 # -------- модели --------
 GPT_MODEL = os.getenv("GPT_INVOICE_MODEL", "gpt-4o-mini")
@@ -146,6 +168,37 @@ def _is_xlsx_zip(b: bytes) -> bool:
 
 def _is_xls_ole(b: bytes) -> bool:
     return b[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+
+
+def _detect_file_type(file_name: str, file_bytes: bytes) -> str:
+    name = (file_name or "").lower()
+
+    if any(name.endswith(ext) for ext in EXCEL_EXTENSIONS):
+        return "excel"
+    if _is_xls_ole(file_bytes):
+        return "excel"
+
+    if any(name.endswith(ext) for ext in PHOTO_EXTENSIONS):
+        return "photo"
+    if file_bytes.startswith(b"\xff\xd8"):
+        return "photo"
+    if file_bytes.startswith(b"\x89PNG"):
+        return "photo"
+
+    return "document"
+
+
+def _run_coroutine_sync(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    new_loop = asyncio.new_event_loop()
+    try:
+        return new_loop.run_until_complete(coro)
+    finally:
+        new_loop.close()
 
 # -------- локальные извлечения --------
 import io as _io
@@ -650,4 +703,106 @@ async def on_approved_send_qr(context: ContextTypes.DEFAULT_TYPE, *, chat_id: in
         message_thread_id=thread_id if thread_id else None,
         reply_to_message_id=status_msg_id,
     )
+
+
+def gpt_process(file_bytes: bytes, file_name: str) -> Tuple[bool, dict, str]:
+    """Синхронный разбор счёта для Flask-версии (main_web_v2)."""
+
+    file_type = _detect_file_type(file_name, file_bytes)
+
+    docx_text = ""
+    base_text = ""
+    if file_type == "document":
+        if _is_pdf(file_bytes):
+            base_text = _pdf_to_text(file_bytes)
+        else:
+            docx_text = _docx_to_text(file_bytes)
+            base_text = docx_text or _pdf_to_text(file_bytes)
+    elif file_type == "excel":
+        base_text = _excel_to_text(file_bytes)
+
+    prehint = _pre_hint(base_text)
+
+    st, fields, notes = _run_coroutine_sync(
+        _call_gpt_on_file(
+            file_bytes,
+            file_type,
+            prehint,
+            docx_text=docx_text,
+            model=GPT_MODEL,
+        )
+    )
+
+    if fields:
+        fields = _sanitize_fields(fields)
+
+    if (not st or not st.startswith("ST00012|")) and fields:
+        if "Sum" in fields and fields["Sum"] and not str(fields["Sum"]).isdigit():
+            rub = re.sub(r"[^\d,\.]", "", str(fields["Sum"]))
+            rub = rub.replace(",", ".")
+            try:
+                fields["Sum"] = str(int(round(float(rub) * 100)))
+            except Exception:
+                pass
+        st = _build_st00012_from_fields(fields)
+
+    err_code = _validate_st00012(st) if st else "payload is not ST00012"
+
+    retries_left = MAX_RETRY_ON_FAIL if GPT_MODEL != RETRY_MODEL else 0
+    while err_code and retries_left > 0:
+        retries_left -= 1
+        st2, fields2, notes2 = _run_coroutine_sync(
+            _call_gpt_on_file(
+                file_bytes,
+                file_type,
+                prehint,
+                docx_text=docx_text,
+                model=RETRY_MODEL,
+            )
+        )
+        if fields2:
+            fields2 = _sanitize_fields(fields2)
+        if (not st2 or not st2.startswith("ST00012|")) and fields2:
+            if "Sum" in fields2 and fields2["Sum"] and not str(fields2["Sum"]).isdigit():
+                rub = re.sub(r"[^\d,\.]", "", str(fields2["Sum"]))
+                rub = rub.replace(",", ".")
+                try:
+                    fields2["Sum"] = str(int(round(float(rub) * 100)))
+                except Exception:
+                    pass
+            st2 = _build_st00012_from_fields(fields2)
+        err2 = _validate_st00012(st2) if st2 else "payload is not ST00012"
+        if not err2 or (
+            err2
+            and fields2
+            and len(_fields_preview(fields2)) > len(_fields_preview(fields or {}))
+        ):
+            st, fields, notes, err_code = st2, fields2, notes2, err2
+            break
+
+    if not err_code and st and fields:
+        return True, fields, notes or ""
+
+    reason = _reason_human(err_code, None, fields)
+    preview = _fields_preview(fields or {})
+    message = "⚠️ Не удалось обработать файл."
+    if reason:
+        message += f"\nПричина: {reason}"
+    if notes and str(notes).strip():
+        message += f"\n\n{str(notes).strip()}"
+    if preview:
+        message += f"\n\nРаспознанные поля (проверьте):\n{preview}"
+
+    return False, fields or {}, message
+
+
+def build_st00012(fields: dict) -> str:
+    clean = _sanitize_fields(fields or {})
+    return _build_st00012_from_fields(clean)
+
+
+def make_qr_png(st: str) -> bytes:
+    if not st or not st.startswith("ST00012|"):
+        raise ValueError("st must be ST00012 payload")
+    return _qr_png_bytes(st)
 
