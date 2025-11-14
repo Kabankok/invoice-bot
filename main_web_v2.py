@@ -3,7 +3,7 @@
 # Маршруты: /healthz, /webhook
 # Логика:
 #   document -> [✅ Подтвердить][❌ Отклонить]
-#   по Подтвердить -> processing.gpt_process() -> ST00012 -> QR -> пояснение
+#   по Подтвердить -> processor.gpt_process() -> ST00012 -> QR -> пояснение
 #   под результатом -> [💳 Оплатить][📥 Забрать][✖ Отмена]
 
 import os
@@ -17,7 +17,7 @@ from flask import Flask, request, jsonify
 from urllib.parse import urlencode
 import urllib.request
 
-from processing import gpt_process, build_st00012, make_qr_png
+from processor import gpt_process, build_st00012, make_qr_png
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
